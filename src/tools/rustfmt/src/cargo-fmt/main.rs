@@ -10,52 +10,67 @@ use std::ffi::OsStr;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
-use std::iter::FromIterator;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str;
 
-use structopt::StructOpt;
+use cargo_metadata::Edition;
+use clap::{CommandFactory, Parser};
 
-#[derive(StructOpt, Debug)]
-#[structopt(
+#[path = "test/mod.rs"]
+#[cfg(test)]
+mod cargo_fmt_tests;
+
+#[derive(Parser)]
+#[command(
+    disable_version_flag = true,
     bin_name = "cargo fmt",
     about = "This utility formats all bin and lib files of \
              the current crate using rustfmt."
 )]
+#[command(styles = clap_cargo::style::CLAP_STYLING)]
 pub struct Opts {
     /// No output printed to stdout
-    #[structopt(short = "q", long = "quiet")]
+    #[arg(short = 'q', long = "quiet")]
     quiet: bool,
 
     /// Use verbose output
-    #[structopt(short = "v", long = "verbose")]
+    #[arg(short = 'v', long = "verbose")]
     verbose: bool,
 
     /// Print rustfmt version and exit
-    #[structopt(long = "version")]
+    #[arg(long = "version")]
     version: bool,
 
-    /// Specify package to format (only usable in workspaces)
-    #[structopt(short = "p", long = "package", value_name = "package")]
+    /// Specify package to format
+    #[arg(
+        short = 'p',
+        long = "package",
+        value_name = "package",
+        num_args = 1..
+    )]
     packages: Vec<String>,
 
     /// Specify path to Cargo.toml
-    #[structopt(long = "manifest-path", value_name = "manifest-path")]
+    #[arg(long = "manifest-path", value_name = "manifest-path")]
     manifest_path: Option<String>,
 
     /// Specify message-format: short|json|human
-    #[structopt(long = "message-format", value_name = "message-format")]
+    #[arg(long = "message-format", value_name = "message-format")]
     message_format: Option<String>,
 
     /// Options passed to rustfmt
     // 'raw = true' to make `--` explicit.
-    #[structopt(name = "rustfmt_options", raw(true))]
+    #[arg(id = "rustfmt_options", raw = true)]
     rustfmt_options: Vec<String>,
 
-    /// Format all packages (only usable in workspaces)
-    #[structopt(long = "all")]
+    /// Format all packages, and also their local path-based dependencies
+    #[arg(long = "all")]
     format_all: bool,
+
+    /// Run rustfmt in check mode
+    #[arg(long = "check")]
+    check: bool,
 }
 
 fn main() {
@@ -79,7 +94,7 @@ fn execute() -> i32 {
         }
     });
 
-    let opts = Opts::from_iter(args);
+    let opts = Opts::parse_from(args);
 
     let verbosity = match (opts.verbose, opts.quiet) {
         (false, false) => Verbosity::Normal,
@@ -104,6 +119,12 @@ fn execute() -> i32 {
 
     let strategy = CargoFmtStrategy::from_opts(&opts);
     let mut rustfmt_args = opts.rustfmt_options;
+    if opts.check {
+        let check_flag = "--check";
+        if !rustfmt_args.iter().any(|o| o == check_flag) {
+            rustfmt_args.push(check_flag.to_owned());
+        }
+    }
     if let Some(message_format) = opts.message_format {
         if let Err(msg) = convert_message_format_to_rustfmt_args(&message_format, &mut rustfmt_args)
         {
@@ -179,24 +200,20 @@ fn convert_message_format_to_rustfmt_args(
             Ok(())
         }
         "human" => Ok(()),
-        _ => {
-            return Err(format!(
-                "invalid --message-format value: {}. Allowed values are: short|json|human",
-                message_format
-            ));
-        }
+        _ => Err(format!(
+            "invalid --message-format value: {message_format}. Allowed values are: short|json|human"
+        )),
     }
 }
 
 fn print_usage_to_stderr(reason: &str) {
-    eprintln!("{}", reason);
-    let app = Opts::clap();
-    app.after_help("")
-        .write_help(&mut io::stderr())
-        .expect("failed to write to stderr");
+    eprintln!("{reason}");
+    let app = Opts::command();
+    let help = app.after_help("").render_help();
+    eprintln!("{help}");
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verbosity {
     Verbose,
     Normal,
@@ -253,7 +270,7 @@ pub struct Target {
     /// A kind of target (e.g., lib, bin, example, ...).
     kind: String,
     /// Rust edition for this target.
-    edition: String,
+    edition: Edition,
 }
 
 impl Target {
@@ -264,7 +281,7 @@ impl Target {
         Target {
             path: canonicalized,
             kind: target.kind[0].clone(),
-            edition: target.edition.clone(),
+            edition: target.edition,
         }
     }
 }
@@ -346,7 +363,7 @@ fn get_targets_root_only(
     manifest_path: Option<&Path>,
     targets: &mut BTreeSet<Target>,
 ) -> Result<(), io::Error> {
-    let metadata = get_cargo_metadata(manifest_path, false)?;
+    let metadata = get_cargo_metadata(manifest_path)?;
     let workspace_root_path = PathBuf::from(&metadata.workspace_root).canonicalize()?;
     let (in_workspace_root, current_dir_manifest) = if let Some(target_manifest) = manifest_path {
         (
@@ -373,8 +390,7 @@ fn get_targets_root_only(
                         .unwrap_or_default()
                         == current_dir_manifest
             })
-            .map(|p| p.targets)
-            .flatten()
+            .flat_map(|p| p.targets)
             .collect(),
     };
 
@@ -387,38 +403,33 @@ fn get_targets_root_only(
 
 fn get_targets_recursive(
     manifest_path: Option<&Path>,
-    mut targets: &mut BTreeSet<Target>,
+    targets: &mut BTreeSet<Target>,
     visited: &mut BTreeSet<String>,
 ) -> Result<(), io::Error> {
-    let metadata = get_cargo_metadata(manifest_path, false)?;
-    let metadata_with_deps = get_cargo_metadata(manifest_path, true)?;
+    let metadata = get_cargo_metadata(manifest_path)?;
+    for package in &metadata.packages {
+        add_targets(&package.targets, targets);
 
-    for package in metadata.packages {
-        add_targets(&package.targets, &mut targets);
-
-        // Look for local dependencies.
-        for dependency in package.dependencies {
-            if dependency.source.is_some() || visited.contains(&dependency.name) {
+        // Look for local dependencies using information available since cargo v1.51
+        // It's theoretically possible someone could use a newer version of rustfmt with
+        // a much older version of `cargo`, but we don't try to explicitly support that scenario.
+        // If someone reports an issue with path-based deps not being formatted, be sure to
+        // confirm their version of `cargo` (not `cargo-fmt`) is >= v1.51
+        // https://github.com/rust-lang/cargo/pull/8994
+        for dependency in &package.dependencies {
+            if dependency.path.is_none() || visited.contains(&dependency.name) {
                 continue;
             }
 
-            let dependency_package = metadata_with_deps
-                .packages
-                .iter()
-                .find(|p| p.name == dependency.name && p.source.is_none());
-            let manifest_path = if let Some(dep_pkg) = dependency_package {
-                PathBuf::from(&dep_pkg.manifest_path)
-            } else {
-                let mut package_manifest_path = PathBuf::from(&package.manifest_path);
-                package_manifest_path.pop();
-                package_manifest_path.push(&dependency.name);
-                package_manifest_path.push("Cargo.toml");
-                package_manifest_path
-            };
-
-            if manifest_path.exists() {
-                visited.insert(dependency.name);
-                get_targets_recursive(Some(&manifest_path), &mut targets, visited)?;
+            let manifest_path = PathBuf::from(dependency.path.as_ref().unwrap()).join("Cargo.toml");
+            if manifest_path.exists()
+                && !metadata
+                    .packages
+                    .iter()
+                    .any(|p| p.manifest_path.eq(&manifest_path))
+            {
+                visited.insert(dependency.name.to_owned());
+                get_targets_recursive(Some(&manifest_path), targets, visited)?;
             }
         }
     }
@@ -431,8 +442,7 @@ fn get_targets_with_hitlist(
     hitlist: &[String],
     targets: &mut BTreeSet<Target>,
 ) -> Result<(), io::Error> {
-    let metadata = get_cargo_metadata(manifest_path, false)?;
-
+    let metadata = get_cargo_metadata(manifest_path)?;
     let mut workspace_hitlist: BTreeSet<&String> = BTreeSet::from_iter(hitlist);
 
     for package in metadata.packages {
@@ -449,7 +459,7 @@ fn get_targets_with_hitlist(
         let package = workspace_hitlist.iter().next().unwrap();
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("package `{}` is not a member of the workspace", package),
+            format!("package `{package}` is not a member of the workspace"),
         ))
     }
 }
@@ -487,7 +497,7 @@ fn run_rustfmt(
 
         if verbosity == Verbosity::Verbose {
             print!("rustfmt");
-            print!(" --edition {}", edition);
+            print!(" --edition {edition}");
             fmt_args.iter().for_each(|f| print!(" {}", f));
             files.iter().for_each(|f| print!(" {}", f.display()));
             println!();
@@ -496,7 +506,7 @@ fn run_rustfmt(
         let mut command = rustfmt_command()
             .stdout(stdout)
             .args(files)
-            .args(&["--edition", edition])
+            .args(["--edition", edition.as_str()])
             .args(fmt_args)
             .spawn()
             .map_err(|e| match e.kind() {
@@ -517,18 +527,13 @@ fn run_rustfmt(
         .unwrap_or(SUCCESS))
 }
 
-fn get_cargo_metadata(
-    manifest_path: Option<&Path>,
-    include_deps: bool,
-) -> Result<cargo_metadata::Metadata, io::Error> {
+fn get_cargo_metadata(manifest_path: Option<&Path>) -> Result<cargo_metadata::Metadata, io::Error> {
     let mut cmd = cargo_metadata::MetadataCommand::new();
-    if !include_deps {
-        cmd.no_deps();
-    }
+    cmd.no_deps();
     if let Some(manifest_path) = manifest_path {
         cmd.manifest_path(manifest_path);
     }
-    cmd.other_options(&[String::from("--offline")]);
+    cmd.other_options(vec![String::from("--offline")]);
 
     match cmd.exec() {
         Ok(metadata) => Ok(metadata),
@@ -538,224 +543,6 @@ fn get_cargo_metadata(
                 Ok(metadata) => Ok(metadata),
                 Err(error) => Err(io::Error::new(io::ErrorKind::Other, error.to_string())),
             }
-        }
-    }
-}
-
-#[cfg(test)]
-mod cargo_fmt_tests {
-    use super::*;
-
-    #[test]
-    fn default_options() {
-        let empty: Vec<String> = vec![];
-        let o = Opts::from_iter(&empty);
-        assert_eq!(false, o.quiet);
-        assert_eq!(false, o.verbose);
-        assert_eq!(false, o.version);
-        assert_eq!(empty, o.packages);
-        assert_eq!(empty, o.rustfmt_options);
-        assert_eq!(false, o.format_all);
-        assert_eq!(None, o.manifest_path);
-        assert_eq!(None, o.message_format);
-    }
-
-    #[test]
-    fn good_options() {
-        let o = Opts::from_iter(&[
-            "test",
-            "-q",
-            "-p",
-            "p1",
-            "-p",
-            "p2",
-            "--message-format",
-            "short",
-            "--",
-            "--edition",
-            "2018",
-        ]);
-        assert_eq!(true, o.quiet);
-        assert_eq!(false, o.verbose);
-        assert_eq!(false, o.version);
-        assert_eq!(vec!["p1", "p2"], o.packages);
-        assert_eq!(vec!["--edition", "2018"], o.rustfmt_options);
-        assert_eq!(false, o.format_all);
-        assert_eq!(Some(String::from("short")), o.message_format);
-    }
-
-    #[test]
-    fn unexpected_option() {
-        assert!(
-            Opts::clap()
-                .get_matches_from_safe(&["test", "unexpected"])
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn unexpected_flag() {
-        assert!(
-            Opts::clap()
-                .get_matches_from_safe(&["test", "--flag"])
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn mandatory_separator() {
-        assert!(
-            Opts::clap()
-                .get_matches_from_safe(&["test", "--check"])
-                .is_err()
-        );
-        assert!(
-            !Opts::clap()
-                .get_matches_from_safe(&["test", "--", "--check"])
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn multiple_packages_one_by_one() {
-        let o = Opts::from_iter(&[
-            "test",
-            "-p",
-            "package1",
-            "--package",
-            "package2",
-            "-p",
-            "package3",
-        ]);
-        assert_eq!(3, o.packages.len());
-    }
-
-    #[test]
-    fn multiple_packages_grouped() {
-        let o = Opts::from_iter(&[
-            "test",
-            "--package",
-            "package1",
-            "package2",
-            "-p",
-            "package3",
-            "package4",
-        ]);
-        assert_eq!(4, o.packages.len());
-    }
-
-    #[test]
-    fn empty_packages_1() {
-        assert!(Opts::clap().get_matches_from_safe(&["test", "-p"]).is_err());
-    }
-
-    #[test]
-    fn empty_packages_2() {
-        assert!(
-            Opts::clap()
-                .get_matches_from_safe(&["test", "-p", "--", "--check"])
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn empty_packages_3() {
-        assert!(
-            Opts::clap()
-                .get_matches_from_safe(&["test", "-p", "--verbose"])
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn empty_packages_4() {
-        assert!(
-            Opts::clap()
-                .get_matches_from_safe(&["test", "-p", "--check"])
-                .is_err()
-        );
-    }
-
-    mod convert_message_format_to_rustfmt_args_tests {
-        use super::*;
-
-        #[test]
-        fn invalid_message_format() {
-            assert_eq!(
-                convert_message_format_to_rustfmt_args("awesome", &mut vec![]),
-                Err(String::from(
-                    "invalid --message-format value: awesome. Allowed values are: short|json|human"
-                )),
-            );
-        }
-
-        #[test]
-        fn json_message_format_and_check_arg() {
-            let mut args = vec![String::from("--check")];
-            assert_eq!(
-                convert_message_format_to_rustfmt_args("json", &mut args),
-                Err(String::from(
-                    "cannot include --check arg when --message-format is set to json"
-                )),
-            );
-        }
-
-        #[test]
-        fn json_message_format_and_emit_arg() {
-            let mut args = vec![String::from("--emit"), String::from("checkstyle")];
-            assert_eq!(
-                convert_message_format_to_rustfmt_args("json", &mut args),
-                Err(String::from(
-                    "cannot include --emit arg when --message-format is set to json"
-                )),
-            );
-        }
-
-        #[test]
-        fn json_message_format() {
-            let mut args = vec![String::from("--edition"), String::from("2018")];
-            assert!(convert_message_format_to_rustfmt_args("json", &mut args).is_ok());
-            assert_eq!(
-                args,
-                vec![
-                    String::from("--edition"),
-                    String::from("2018"),
-                    String::from("--emit"),
-                    String::from("json")
-                ]
-            );
-        }
-
-        #[test]
-        fn human_message_format() {
-            let exp_args = vec![String::from("--emit"), String::from("json")];
-            let mut act_args = exp_args.clone();
-            assert!(convert_message_format_to_rustfmt_args("human", &mut act_args).is_ok());
-            assert_eq!(act_args, exp_args);
-        }
-
-        #[test]
-        fn short_message_format() {
-            let mut args = vec![String::from("--check")];
-            assert!(convert_message_format_to_rustfmt_args("short", &mut args).is_ok());
-            assert_eq!(args, vec![String::from("--check"), String::from("-l")]);
-        }
-
-        #[test]
-        fn short_message_format_included_short_list_files_flag() {
-            let mut args = vec![String::from("--check"), String::from("-l")];
-            assert!(convert_message_format_to_rustfmt_args("short", &mut args).is_ok());
-            assert_eq!(args, vec![String::from("--check"), String::from("-l")]);
-        }
-
-        #[test]
-        fn short_message_format_included_long_list_files_flag() {
-            let mut args = vec![String::from("--check"), String::from("--files-with-diff")];
-            assert!(convert_message_format_to_rustfmt_args("short", &mut args).is_ok());
-            assert_eq!(
-                args,
-                vec![String::from("--check"), String::from("--files-with-diff")]
-            );
         }
     }
 }

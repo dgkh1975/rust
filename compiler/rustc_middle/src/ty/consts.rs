@@ -1,11 +1,12 @@
-use crate::mir::interpret::ConstValue;
-use crate::mir::interpret::{LitToConstInput, Scalar};
-use crate::ty::{self, Ty, TyCtxt};
-use crate::ty::{ParamEnv, ParamEnvAnd};
-use rustc_errors::ErrorReported;
-use rustc_hir as hir;
-use rustc_hir::def_id::{DefId, LocalDefId};
+use std::borrow::Cow;
+
+use rustc_data_structures::intern::Interned;
+use rustc_error_messages::MultiSpan;
 use rustc_macros::HashStable;
+use rustc_type_ir::{self as ir, TypeFlags, WithCachedTypeInfo};
+
+use crate::mir::interpret::Scalar;
+use crate::ty::{self, Ty, TyCtxt};
 
 mod int;
 mod kind;
@@ -13,206 +14,250 @@ mod valtree;
 
 pub use int::*;
 pub use kind::*;
+use rustc_span::{DUMMY_SP, ErrorGuaranteed};
 pub use valtree::*;
 
-/// Typed constant value.
-#[derive(Copy, Clone, Debug, Hash, TyEncodable, TyDecodable, Eq, PartialEq, Ord, PartialOrd)]
-#[derive(HashStable)]
-pub struct Const<'tcx> {
-    pub ty: Ty<'tcx>,
+pub type ConstKind<'tcx> = ir::ConstKind<TyCtxt<'tcx>>;
+pub type UnevaluatedConst<'tcx> = ir::UnevaluatedConst<TyCtxt<'tcx>>;
 
-    pub val: ConstKind<'tcx>,
+#[cfg(target_pointer_width = "64")]
+rustc_data_structures::static_assert_size!(ConstKind<'_>, 32);
+
+#[derive(Copy, Clone, PartialEq, Eq, Hash, HashStable)]
+#[rustc_pass_by_value]
+pub struct Const<'tcx>(pub(super) Interned<'tcx, WithCachedTypeInfo<ConstKind<'tcx>>>);
+
+impl<'tcx> rustc_type_ir::inherent::IntoKind for Const<'tcx> {
+    type Kind = ConstKind<'tcx>;
+
+    fn kind(self) -> ConstKind<'tcx> {
+        self.kind()
+    }
 }
 
-#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-static_assert_size!(Const<'_>, 48);
+impl<'tcx> rustc_type_ir::visit::Flags for Const<'tcx> {
+    fn flags(&self) -> TypeFlags {
+        self.0.flags
+    }
+
+    fn outer_exclusive_binder(&self) -> rustc_type_ir::DebruijnIndex {
+        self.0.outer_exclusive_binder
+    }
+}
 
 impl<'tcx> Const<'tcx> {
-    /// Literals and const generic parameters are eagerly converted to a constant, everything else
-    /// becomes `Unevaluated`.
-    pub fn from_anon_const(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> &'tcx Self {
-        Self::from_opt_const_arg_anon_const(tcx, ty::WithOptConstParam::unknown(def_id))
+    #[inline]
+    pub fn kind(self) -> ConstKind<'tcx> {
+        let a: &ConstKind<'tcx> = self.0.0;
+        *a
     }
 
-    pub fn from_opt_const_arg_anon_const(
+    // FIXME(compiler-errors): Think about removing this.
+    #[inline]
+    pub fn flags(self) -> TypeFlags {
+        self.0.flags
+    }
+
+    // FIXME(compiler-errors): Think about removing this.
+    #[inline]
+    pub fn outer_exclusive_binder(self) -> ty::DebruijnIndex {
+        self.0.outer_exclusive_binder
+    }
+
+    #[inline]
+    pub fn new(tcx: TyCtxt<'tcx>, kind: ty::ConstKind<'tcx>) -> Const<'tcx> {
+        tcx.mk_ct_from_kind(kind)
+    }
+
+    #[inline]
+    pub fn new_param(tcx: TyCtxt<'tcx>, param: ty::ParamConst) -> Const<'tcx> {
+        Const::new(tcx, ty::ConstKind::Param(param))
+    }
+
+    #[inline]
+    pub fn new_var(tcx: TyCtxt<'tcx>, infer: ty::ConstVid) -> Const<'tcx> {
+        Const::new(tcx, ty::ConstKind::Infer(ty::InferConst::Var(infer)))
+    }
+
+    #[inline]
+    pub fn new_fresh(tcx: TyCtxt<'tcx>, fresh: u32) -> Const<'tcx> {
+        Const::new(tcx, ty::ConstKind::Infer(ty::InferConst::Fresh(fresh)))
+    }
+
+    #[inline]
+    pub fn new_infer(tcx: TyCtxt<'tcx>, infer: ty::InferConst) -> Const<'tcx> {
+        Const::new(tcx, ty::ConstKind::Infer(infer))
+    }
+
+    #[inline]
+    pub fn new_bound(
         tcx: TyCtxt<'tcx>,
-        def: ty::WithOptConstParam<LocalDefId>,
-    ) -> &'tcx Self {
-        debug!("Const::from_anon_const(def={:?})", def);
-
-        let hir_id = tcx.hir().local_def_id_to_hir_id(def.did);
-
-        let body_id = match tcx.hir().get(hir_id) {
-            hir::Node::AnonConst(ac) => ac.body,
-            _ => span_bug!(
-                tcx.def_span(def.did.to_def_id()),
-                "from_anon_const can only process anonymous constants"
-            ),
-        };
-
-        let expr = &tcx.hir().body(body_id).value;
-
-        let ty = tcx.type_of(def.def_id_for_type_of());
-
-        let lit_input = match expr.kind {
-            hir::ExprKind::Lit(ref lit) => Some(LitToConstInput { lit: &lit.node, ty, neg: false }),
-            hir::ExprKind::Unary(hir::UnOp::Neg, ref expr) => match expr.kind {
-                hir::ExprKind::Lit(ref lit) => {
-                    Some(LitToConstInput { lit: &lit.node, ty, neg: true })
-                }
-                _ => None,
-            },
-            _ => None,
-        };
-
-        if let Some(lit_input) = lit_input {
-            // If an error occurred, ignore that it's a literal and leave reporting the error up to
-            // mir.
-            if let Ok(c) = tcx.at(expr.span).lit_to_const(lit_input) {
-                return c;
-            } else {
-                tcx.sess.delay_span_bug(expr.span, "Const::from_anon_const: couldn't lit_to_const");
-            }
-        }
-
-        // Unwrap a block, so that e.g. `{ P }` is recognised as a parameter. Const arguments
-        // currently have to be wrapped in curly brackets, so it's necessary to special-case.
-        let expr = match &expr.kind {
-            hir::ExprKind::Block(block, _) if block.stmts.is_empty() && block.expr.is_some() => {
-                block.expr.as_ref().unwrap()
-            }
-            _ => expr,
-        };
-
-        use hir::{def::DefKind::ConstParam, def::Res, ExprKind, Path, QPath};
-        let val = match expr.kind {
-            ExprKind::Path(QPath::Resolved(_, &Path { res: Res::Def(ConstParam, def_id), .. })) => {
-                // Find the name and index of the const parameter by indexing the generics of
-                // the parent item and construct a `ParamConst`.
-                let hir_id = tcx.hir().local_def_id_to_hir_id(def_id.expect_local());
-                let item_id = tcx.hir().get_parent_node(hir_id);
-                let item_def_id = tcx.hir().local_def_id(item_id);
-                let generics = tcx.generics_of(item_def_id.to_def_id());
-                let index = generics.param_def_id_to_index[&def_id];
-                let name = tcx.hir().name(hir_id);
-                ty::ConstKind::Param(ty::ParamConst::new(index, name))
-            }
-            _ => ty::ConstKind::Unevaluated(ty::Unevaluated {
-                def: def.to_global(),
-                substs_: None,
-                promoted: None,
-            }),
-        };
-
-        tcx.mk_const(ty::Const { val, ty })
-    }
-
-    /// Interns the given value as a constant.
-    #[inline]
-    pub fn from_value(tcx: TyCtxt<'tcx>, val: ConstValue<'tcx>, ty: Ty<'tcx>) -> &'tcx Self {
-        tcx.mk_const(Self { val: ConstKind::Value(val), ty })
+        debruijn: ty::DebruijnIndex,
+        var: ty::BoundVar,
+    ) -> Const<'tcx> {
+        Const::new(tcx, ty::ConstKind::Bound(debruijn, var))
     }
 
     #[inline]
-    /// Interns the given scalar as a constant.
-    pub fn from_scalar(tcx: TyCtxt<'tcx>, val: Scalar, ty: Ty<'tcx>) -> &'tcx Self {
-        Self::from_value(tcx, ConstValue::Scalar(val), ty)
+    pub fn new_placeholder(tcx: TyCtxt<'tcx>, placeholder: ty::PlaceholderConst) -> Const<'tcx> {
+        Const::new(tcx, ty::ConstKind::Placeholder(placeholder))
     }
 
     #[inline]
+    pub fn new_unevaluated(tcx: TyCtxt<'tcx>, uv: ty::UnevaluatedConst<'tcx>) -> Const<'tcx> {
+        tcx.debug_assert_args_compatible(uv.def, uv.args);
+        Const::new(tcx, ty::ConstKind::Unevaluated(uv))
+    }
+
+    #[inline]
+    pub fn new_value(tcx: TyCtxt<'tcx>, val: ty::ValTree<'tcx>, ty: Ty<'tcx>) -> Const<'tcx> {
+        Const::new(tcx, ty::ConstKind::Value(ty, val))
+    }
+
+    #[inline]
+    pub fn new_expr(tcx: TyCtxt<'tcx>, expr: ty::Expr<'tcx>) -> Const<'tcx> {
+        Const::new(tcx, ty::ConstKind::Expr(expr))
+    }
+
+    #[inline]
+    pub fn new_error(tcx: TyCtxt<'tcx>, e: ty::ErrorGuaranteed) -> Const<'tcx> {
+        Const::new(tcx, ty::ConstKind::Error(e))
+    }
+
+    /// Like [Ty::new_error] but for constants.
+    #[track_caller]
+    pub fn new_misc_error(tcx: TyCtxt<'tcx>) -> Const<'tcx> {
+        Const::new_error_with_message(
+            tcx,
+            DUMMY_SP,
+            "ty::ConstKind::Error constructed but no error reported",
+        )
+    }
+
+    /// Like [Ty::new_error_with_message] but for constants.
+    #[track_caller]
+    pub fn new_error_with_message<S: Into<MultiSpan>>(
+        tcx: TyCtxt<'tcx>,
+        span: S,
+        msg: impl Into<Cow<'static, str>>,
+    ) -> Const<'tcx> {
+        let reported = tcx.dcx().span_delayed_bug(span, msg);
+        Const::new_error(tcx, reported)
+    }
+}
+
+impl<'tcx> rustc_type_ir::inherent::Const<TyCtxt<'tcx>> for Const<'tcx> {
+    fn new_infer(tcx: TyCtxt<'tcx>, infer: ty::InferConst) -> Self {
+        Const::new_infer(tcx, infer)
+    }
+
+    fn new_var(tcx: TyCtxt<'tcx>, vid: ty::ConstVid) -> Self {
+        Const::new_var(tcx, vid)
+    }
+
+    fn new_bound(interner: TyCtxt<'tcx>, debruijn: ty::DebruijnIndex, var: ty::BoundVar) -> Self {
+        Const::new_bound(interner, debruijn, var)
+    }
+
+    fn new_anon_bound(tcx: TyCtxt<'tcx>, debruijn: ty::DebruijnIndex, var: ty::BoundVar) -> Self {
+        Const::new_bound(tcx, debruijn, var)
+    }
+
+    fn new_unevaluated(interner: TyCtxt<'tcx>, uv: ty::UnevaluatedConst<'tcx>) -> Self {
+        Const::new_unevaluated(interner, uv)
+    }
+
+    fn new_expr(interner: TyCtxt<'tcx>, expr: ty::Expr<'tcx>) -> Self {
+        Const::new_expr(interner, expr)
+    }
+
+    fn new_error(interner: TyCtxt<'tcx>, guar: ErrorGuaranteed) -> Self {
+        Const::new_error(interner, guar)
+    }
+}
+
+impl<'tcx> Const<'tcx> {
     /// Creates a constant with the given integer value and interns it.
-    pub fn from_bits(tcx: TyCtxt<'tcx>, bits: u128, ty: ParamEnvAnd<'tcx, Ty<'tcx>>) -> &'tcx Self {
+    #[inline]
+    pub fn from_bits(
+        tcx: TyCtxt<'tcx>,
+        bits: u128,
+        typing_env: ty::TypingEnv<'tcx>,
+        ty: Ty<'tcx>,
+    ) -> Self {
         let size = tcx
-            .layout_of(ty)
-            .unwrap_or_else(|e| panic!("could not compute layout for {:?}: {:?}", ty, e))
+            .layout_of(typing_env.as_query_input(ty))
+            .unwrap_or_else(|e| panic!("could not compute layout for {ty:?}: {e:?}"))
             .size;
-        Self::from_scalar(tcx, Scalar::from_uint(bits, size), ty.value)
+        ty::Const::new_value(
+            tcx,
+            ty::ValTree::from_scalar_int(ScalarInt::try_from_uint(bits, size).unwrap()),
+            ty,
+        )
     }
 
     #[inline]
     /// Creates an interned zst constant.
-    pub fn zero_sized(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> &'tcx Self {
-        Self::from_scalar(tcx, Scalar::ZST, ty)
+    pub fn zero_sized(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Self {
+        ty::Const::new_value(tcx, ty::ValTree::zst(), ty)
     }
 
     #[inline]
     /// Creates an interned bool constant.
-    pub fn from_bool(tcx: TyCtxt<'tcx>, v: bool) -> &'tcx Self {
-        Self::from_bits(tcx, v as u128, ParamEnv::empty().and(tcx.types.bool))
+    pub fn from_bool(tcx: TyCtxt<'tcx>, v: bool) -> Self {
+        Self::from_bits(tcx, v as u128, ty::TypingEnv::fully_monomorphized(), tcx.types.bool)
     }
 
     #[inline]
     /// Creates an interned usize constant.
-    pub fn from_usize(tcx: TyCtxt<'tcx>, n: u64) -> &'tcx Self {
-        Self::from_bits(tcx, n as u128, ParamEnv::empty().and(tcx.types.usize))
+    pub fn from_target_usize(tcx: TyCtxt<'tcx>, n: u64) -> Self {
+        Self::from_bits(tcx, n as u128, ty::TypingEnv::fully_monomorphized(), tcx.types.usize)
     }
 
-    #[inline]
-    /// Attempts to evaluate the given constant to bits. Can fail to evaluate in the presence of
-    /// generics (or erroneous code) or if the value can't be represented as bits (e.g. because it
-    /// contains const generic parameters or pointers).
-    pub fn try_eval_bits(
-        &self,
-        tcx: TyCtxt<'tcx>,
-        param_env: ParamEnv<'tcx>,
-        ty: Ty<'tcx>,
-    ) -> Option<u128> {
-        assert_eq!(self.ty, ty);
-        let size = tcx.layout_of(param_env.with_reveal_all_normalized(tcx).and(ty)).ok()?.size;
-        // if `ty` does not depend on generic parameters, use an empty param_env
-        self.val.eval(tcx, param_env).try_to_bits(size)
+    /// Panics if self.kind != ty::ConstKind::Value
+    pub fn to_valtree(self) -> (ty::ValTree<'tcx>, Ty<'tcx>) {
+        match self.kind() {
+            ty::ConstKind::Value(ty, valtree) => (valtree, ty),
+            _ => bug!("expected ConstKind::Value, got {:?}", self.kind()),
+        }
     }
 
-    #[inline]
-    pub fn try_eval_bool(&self, tcx: TyCtxt<'tcx>, param_env: ParamEnv<'tcx>) -> Option<bool> {
-        self.val.eval(tcx, param_env).try_to_bool()
-    }
-
-    #[inline]
-    pub fn try_eval_usize(&self, tcx: TyCtxt<'tcx>, param_env: ParamEnv<'tcx>) -> Option<u64> {
-        self.val.eval(tcx, param_env).try_to_machine_usize(tcx)
-    }
-
-    #[inline]
-    /// Tries to evaluate the constant if it is `Unevaluated`. If that doesn't succeed, return the
-    /// unevaluated constant.
-    pub fn eval(&self, tcx: TyCtxt<'tcx>, param_env: ParamEnv<'tcx>) -> &Const<'tcx> {
-        if let Some(val) = self.val.try_eval(tcx, param_env) {
-            match val {
-                Ok(val) => Const::from_value(tcx, val, self.ty),
-                Err(ErrorReported) => tcx.const_error(self.ty),
-            }
-        } else {
-            self
+    /// Attempts to convert to a `ValTree`
+    pub fn try_to_valtree(self) -> Option<(ty::ValTree<'tcx>, Ty<'tcx>)> {
+        match self.kind() {
+            ty::ConstKind::Value(ty, valtree) => Some((valtree, ty)),
+            _ => None,
         }
     }
 
     #[inline]
-    /// Panics if the value cannot be evaluated or doesn't contain a valid integer of the given type.
-    pub fn eval_bits(&self, tcx: TyCtxt<'tcx>, param_env: ParamEnv<'tcx>, ty: Ty<'tcx>) -> u128 {
-        self.try_eval_bits(tcx, param_env, ty)
-            .unwrap_or_else(|| bug!("expected bits of {:#?}, got {:#?}", ty, self))
+    pub fn try_to_scalar(self) -> Option<(Scalar, Ty<'tcx>)> {
+        let (valtree, ty) = self.try_to_valtree()?;
+        Some((valtree.try_to_scalar()?, ty))
+    }
+
+    pub fn try_to_bool(self) -> Option<bool> {
+        self.try_to_valtree()?.0.try_to_scalar_int()?.try_to_bool().ok()
     }
 
     #[inline]
-    /// Panics if the value cannot be evaluated or doesn't contain a valid `usize`.
-    pub fn eval_usize(&self, tcx: TyCtxt<'tcx>, param_env: ParamEnv<'tcx>) -> u64 {
-        self.try_eval_usize(tcx, param_env)
-            .unwrap_or_else(|| bug!("expected usize, got {:#?}", self))
+    pub fn try_to_target_usize(self, tcx: TyCtxt<'tcx>) -> Option<u64> {
+        self.try_to_valtree()?.0.try_to_target_usize(tcx)
     }
-}
 
-pub fn const_param_default<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> &'tcx Const<'tcx> {
-    let hir_id = tcx.hir().local_def_id_to_hir_id(def_id.expect_local());
-    let default_def_id = match tcx.hir().get(hir_id) {
-        hir::Node::GenericParam(hir::GenericParam {
-            kind: hir::GenericParamKind::Const { ty: _, default: Some(ac) },
-            ..
-        }) => tcx.hir().local_def_id(ac.hir_id),
-        _ => span_bug!(
-            tcx.def_span(def_id),
-            "`const_param_default` expected a generic parameter with a constant"
-        ),
-    };
-    Const::from_anon_const(tcx, default_def_id)
+    /// Attempts to evaluate the given constant to bits. Can fail to evaluate in the presence of
+    /// generics (or erroneous code) or if the value can't be represented as bits (e.g. because it
+    /// contains const generic parameters or pointers).
+    #[inline]
+    pub fn try_to_bits(self, tcx: TyCtxt<'tcx>, typing_env: ty::TypingEnv<'tcx>) -> Option<u128> {
+        let (scalar, ty) = self.try_to_scalar()?;
+        let scalar = scalar.try_to_scalar_int().ok()?;
+        let input = typing_env.with_post_analysis_normalized(tcx).as_query_input(ty);
+        let size = tcx.layout_of(input).ok()?.size;
+        Some(scalar.to_bits(size))
+    }
+
+    pub fn is_ct_infer(self) -> bool {
+        matches!(self.kind(), ty::ConstKind::Infer(_))
+    }
 }

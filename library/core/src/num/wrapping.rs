@@ -1,10 +1,10 @@
 //! Definitions of `Wrapping<T>`.
 
 use crate::fmt;
-use crate::ops::{Add, AddAssign, BitAnd, BitAndAssign, BitOr, BitOrAssign};
-use crate::ops::{BitXor, BitXorAssign, Div, DivAssign};
-use crate::ops::{Mul, MulAssign, Neg, Not, Rem, RemAssign};
-use crate::ops::{Shl, ShlAssign, Shr, ShrAssign, Sub, SubAssign};
+use crate::ops::{
+    Add, AddAssign, BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Div, DivAssign,
+    Mul, MulAssign, Neg, Not, Rem, RemAssign, Shl, ShlAssign, Shr, ShrAssign, Sub, SubAssign,
+};
 
 /// Provides intentionally-wrapped arithmetic on `T`.
 ///
@@ -39,6 +39,7 @@ use crate::ops::{Shl, ShlAssign, Shr, ShrAssign, Sub, SubAssign};
 #[stable(feature = "rust1", since = "1.0.0")]
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Default, Hash)]
 #[repr(transparent)]
+#[rustc_diagnostic_item = "Wrapping"]
 pub struct Wrapping<T>(#[stable(feature = "rust1", since = "1.0.0")] pub T);
 
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -229,6 +230,15 @@ macro_rules! wrapping_impl {
         }
         forward_ref_op_assign! { impl AddAssign, add_assign for Wrapping<$t>, Wrapping<$t> }
 
+        #[stable(feature = "wrapping_int_assign_impl", since = "1.60.0")]
+        impl AddAssign<$t> for Wrapping<$t> {
+            #[inline]
+            fn add_assign(&mut self, other: $t) {
+                *self = *self + Wrapping(other);
+            }
+        }
+        forward_ref_op_assign! { impl AddAssign, add_assign for Wrapping<$t>, $t }
+
         #[stable(feature = "rust1", since = "1.0.0")]
         impl Sub for Wrapping<$t> {
             type Output = Wrapping<$t>;
@@ -249,6 +259,15 @@ macro_rules! wrapping_impl {
             }
         }
         forward_ref_op_assign! { impl SubAssign, sub_assign for Wrapping<$t>, Wrapping<$t> }
+
+        #[stable(feature = "wrapping_int_assign_impl", since = "1.60.0")]
+        impl SubAssign<$t> for Wrapping<$t> {
+            #[inline]
+            fn sub_assign(&mut self, other: $t) {
+                *self = *self - Wrapping(other);
+            }
+        }
+        forward_ref_op_assign! { impl SubAssign, sub_assign for Wrapping<$t>, $t }
 
         #[stable(feature = "rust1", since = "1.0.0")]
         impl Mul for Wrapping<$t> {
@@ -271,6 +290,15 @@ macro_rules! wrapping_impl {
         }
         forward_ref_op_assign! { impl MulAssign, mul_assign for Wrapping<$t>, Wrapping<$t> }
 
+        #[stable(feature = "wrapping_int_assign_impl", since = "1.60.0")]
+        impl MulAssign<$t> for Wrapping<$t> {
+            #[inline]
+            fn mul_assign(&mut self, other: $t) {
+                *self = *self * Wrapping(other);
+            }
+        }
+        forward_ref_op_assign! { impl MulAssign, mul_assign for Wrapping<$t>, $t }
+
         #[stable(feature = "wrapping_div", since = "1.3.0")]
         impl Div for Wrapping<$t> {
             type Output = Wrapping<$t>;
@@ -292,6 +320,15 @@ macro_rules! wrapping_impl {
         }
         forward_ref_op_assign! { impl DivAssign, div_assign for Wrapping<$t>, Wrapping<$t> }
 
+        #[stable(feature = "wrapping_int_assign_impl", since = "1.60.0")]
+        impl DivAssign<$t> for Wrapping<$t> {
+            #[inline]
+            fn div_assign(&mut self, other: $t) {
+                *self = *self / Wrapping(other);
+            }
+        }
+        forward_ref_op_assign! { impl DivAssign, div_assign for Wrapping<$t>, $t }
+
         #[stable(feature = "wrapping_impls", since = "1.7.0")]
         impl Rem for Wrapping<$t> {
             type Output = Wrapping<$t>;
@@ -312,6 +349,15 @@ macro_rules! wrapping_impl {
             }
         }
         forward_ref_op_assign! { impl RemAssign, rem_assign for Wrapping<$t>, Wrapping<$t> }
+
+        #[stable(feature = "wrapping_int_assign_impl", since = "1.60.0")]
+        impl RemAssign<$t> for Wrapping<$t> {
+            #[inline]
+            fn rem_assign(&mut self, other: $t) {
+                *self = *self % Wrapping(other);
+            }
+        }
+        forward_ref_op_assign! { impl RemAssign, rem_assign for Wrapping<$t>, $t }
 
         #[stable(feature = "rust1", since = "1.0.0")]
         impl Not for Wrapping<$t> {
@@ -346,6 +392,15 @@ macro_rules! wrapping_impl {
         }
         forward_ref_op_assign! { impl BitXorAssign, bitxor_assign for Wrapping<$t>, Wrapping<$t> }
 
+        #[stable(feature = "wrapping_int_assign_impl", since = "1.60.0")]
+        impl BitXorAssign<$t> for Wrapping<$t> {
+            #[inline]
+            fn bitxor_assign(&mut self, other: $t) {
+                *self = *self ^ Wrapping(other);
+            }
+        }
+        forward_ref_op_assign! { impl BitXorAssign, bitxor_assign for Wrapping<$t>, $t }
+
         #[stable(feature = "rust1", since = "1.0.0")]
         impl BitOr for Wrapping<$t> {
             type Output = Wrapping<$t>;
@@ -367,6 +422,15 @@ macro_rules! wrapping_impl {
         }
         forward_ref_op_assign! { impl BitOrAssign, bitor_assign for Wrapping<$t>, Wrapping<$t> }
 
+        #[stable(feature = "wrapping_int_assign_impl", since = "1.60.0")]
+        impl BitOrAssign<$t> for Wrapping<$t> {
+            #[inline]
+            fn bitor_assign(&mut self, other: $t) {
+                *self = *self | Wrapping(other);
+            }
+        }
+        forward_ref_op_assign! { impl BitOrAssign, bitor_assign for Wrapping<$t>, $t }
+
         #[stable(feature = "rust1", since = "1.0.0")]
         impl BitAnd for Wrapping<$t> {
             type Output = Wrapping<$t>;
@@ -387,6 +451,15 @@ macro_rules! wrapping_impl {
             }
         }
         forward_ref_op_assign! { impl BitAndAssign, bitand_assign for Wrapping<$t>, Wrapping<$t> }
+
+        #[stable(feature = "wrapping_int_assign_impl", since = "1.60.0")]
+        impl BitAndAssign<$t> for Wrapping<$t> {
+            #[inline]
+            fn bitand_assign(&mut self, other: $t) {
+                *self = *self & Wrapping(other);
+            }
+        }
+        forward_ref_op_assign! { impl BitAndAssign, bitand_assign for Wrapping<$t>, $t }
 
         #[stable(feature = "wrapping_neg", since = "1.10.0")]
         impl Neg for Wrapping<$t> {
@@ -970,7 +1043,7 @@ macro_rules! wrapping_int_impl_unsigned {
             #[must_use = "this returns the result of the operation, \
                           without modifying the original"]
             #[unstable(feature = "wrapping_next_power_of_two", issue = "32463",
-                       reason = "needs decision on wrapping behaviour")]
+                       reason = "needs decision on wrapping behavior")]
             pub fn next_power_of_two(self) -> Self {
                 Wrapping(self.0.wrapping_next_power_of_two())
             }

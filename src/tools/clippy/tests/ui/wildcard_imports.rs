@@ -1,10 +1,13 @@
-// run-rustfix
-// aux-build:wildcard_imports_helper.rs
+//@edition:2015
+
+//@aux-build:wildcard_imports_helper.rs
+
+// the 2015 edition here is needed because edition 2018 changed the module system
+// (see https://doc.rust-lang.org/edition-guide/rust-2018/path-changes.html) which means the lint
+// no longer detects some of the cases starting with Rust 2018.
 
 #![warn(clippy::wildcard_imports)]
-//#![allow(clippy::redundant_pub_crate)]
-#![allow(unused)]
-#![allow(clippy::unnecessary_wraps)]
+#![allow(unused, clippy::unnecessary_wraps, clippy::let_unit_value)]
 #![warn(unused_imports)]
 
 extern crate wildcard_imports_helper;
@@ -21,6 +24,7 @@ use wildcard_imports_helper::inner::inner_for_self_import::*;
 use wildcard_imports_helper::*;
 
 use std::io::prelude::*;
+use wildcard_imports_helper::extern_prelude::v1::*;
 use wildcard_imports_helper::prelude::v1::*;
 
 struct ReadFoo;
@@ -65,6 +69,34 @@ mod struct_mod {
     }
 }
 
+// issue 9942
+mod underscore_mod {
+    // allow use of `deref` so that `clippy --fix` includes `Deref`.
+    #![allow(noop_method_call)]
+
+    mod exports_underscore {
+        pub use std::ops::Deref as _;
+        pub fn dummy() {}
+    }
+
+    mod exports_underscore_ish {
+        pub use std::ops::Deref as _Deref;
+        pub fn dummy() {}
+    }
+
+    fn does_not_lint() {
+        use self::exports_underscore::*;
+        let _ = (&0).deref();
+        dummy();
+    }
+
+    fn does_lint() {
+        use self::exports_underscore_ish::*;
+        let _ = (&0).deref();
+        dummy();
+    }
+}
+
 fn main() {
     foo();
     multi_foo();
@@ -78,6 +110,7 @@ fn main() {
     let _ = inner_struct_mod::C;
     let _ = ExternA;
     let _ = PreludeModAnywhere;
+    let _ = ExternPreludeModAnywhere;
 
     double_struct_import_test!();
     double_struct_import_test!();
@@ -107,6 +140,7 @@ mod in_fn_test {
     }
 
     fn test_inner_nested() {
+        #[rustfmt::skip]
         use self::{inner::*, inner2::*};
 
         inner_foo();
@@ -171,6 +205,7 @@ mod super_imports {
         }
     }
 
+    #[cfg(test)]
     mod test_should_pass {
         use super::*;
 
@@ -179,6 +214,7 @@ mod super_imports {
         }
     }
 
+    #[cfg(test)]
     mod test_should_pass_inside_function {
         fn with_super_inside_function() {
             use super::*;
@@ -186,6 +222,7 @@ mod super_imports {
         }
     }
 
+    #[cfg(test)]
     mod test_should_pass_further_inside {
         fn insidefoo() {}
         mod inner {
@@ -196,7 +233,7 @@ mod super_imports {
         }
     }
 
-    mod should_be_replaced_futher_inside {
+    mod should_be_replaced_further_inside {
         fn insidefoo() {}
         mod inner {
             use super::*;
@@ -207,7 +244,7 @@ mod super_imports {
     }
 
     mod use_explicit_should_be_replaced {
-        use super_imports::*;
+        use crate::super_imports::*;
 
         fn with_explicit() {
             let _ = foofoo();
@@ -228,6 +265,14 @@ mod super_imports {
         use super::super::super_imports::*;
 
         fn with_super_explicit() {
+            let _ = foofoo();
+        }
+    }
+
+    mod attestation_should_be_replaced {
+        use super::*;
+
+        fn with_explicit() {
             let _ = foofoo();
         }
     }

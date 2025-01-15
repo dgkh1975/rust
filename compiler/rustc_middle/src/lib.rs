@@ -4,15 +4,16 @@
 //! has their own README with further details).
 //!
 //! - **HIR.** The "high-level (H) intermediate representation (IR)" is
-//!   defined in the `hir` module.
+//!   defined in the [`hir`] module.
 //! - **MIR.** The "mid-level (M) intermediate representation (IR)" is
-//!   defined in the `mir` module. This module contains only the
+//!   defined in the [`mir`] module. This module contains only the
 //!   *definition* of the MIR; the passes that transform and operate
 //!   on MIR are found in `rustc_const_eval` crate.
 //! - **Types.** The internal representation of types used in rustc is
-//!   defined in the `ty` module. This includes the **type context**
-//!   (or `tcx`), which is the central context during most of
-//!   compilation, containing the interners and other things.
+//!   defined in the [`ty`] module. This includes the
+//!   [**type context**][ty::TyCtxt] (or `tcx`), which is the central
+//!   context during most of compilation, containing the interners and
+//!   other things.
 //!
 //! For more information about how rustc works, see the [rustc dev guide].
 //!
@@ -22,50 +23,48 @@
 //!
 //! This API is completely unstable and subject to change.
 
+// tidy-alphabetical-start
+#![allow(internal_features)]
+#![allow(rustc::diagnostic_outside_of_impl)]
+#![allow(rustc::potential_query_instability)]
+#![allow(rustc::untranslatable_diagnostic)]
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
+#![doc(rust_logo)]
 #![feature(allocator_api)]
 #![feature(array_windows)]
 #![feature(assert_matches)]
-#![feature(backtrace)]
-#![feature(bool_to_option)]
-#![feature(box_patterns)]
-#![feature(core_intrinsics)]
-#![feature(discriminant_kind)]
-#![feature(exhaustive_patterns)]
-#![feature(if_let_guard)]
-#![feature(map_first_last)]
-#![feature(never_type)]
-#![feature(extern_types)]
-#![feature(new_uninit)]
-#![feature(nll)]
-#![feature(once_cell)]
-#![feature(min_specialization)]
-#![feature(trusted_len)]
-#![feature(in_band_lifetimes)]
-#![feature(crate_visibility_modifier)]
-#![feature(associated_type_bounds)]
-#![feature(rustc_attrs)]
-#![feature(half_open_range_patterns)]
-#![feature(control_flow_enum)]
 #![feature(associated_type_defaults)]
-#![feature(iter_zip)]
-#![feature(thread_local_const_init)]
-#![feature(trusted_step)]
+#![feature(box_as_ptr)]
+#![feature(box_patterns)]
+#![feature(closure_track_caller)]
+#![feature(const_type_name)]
+#![feature(core_intrinsics)]
+#![feature(coroutines)]
+#![feature(decl_macro)]
+#![feature(discriminant_kind)]
+#![feature(extern_types)]
+#![feature(extract_if)]
+#![feature(file_buffered)]
+#![feature(if_let_guard)]
+#![feature(intra_doc_pointers)]
+#![feature(iter_from_coroutine)]
+#![feature(let_chains)]
+#![feature(macro_metavar_expr)]
+#![feature(min_specialization)]
+#![feature(negative_impls)]
+#![feature(never_type)]
+#![feature(ptr_alignment_type)]
+#![feature(rustc_attrs)]
+#![feature(rustdoc_internals)]
+#![feature(trait_upcasting)]
+#![feature(trusted_len)]
 #![feature(try_blocks)]
-#![feature(try_reserve_kind)]
-#![feature(nonzero_ops)]
-#![recursion_limit = "512"]
-
-#[macro_use]
-extern crate bitflags;
-#[macro_use]
-extern crate rustc_macros;
-#[macro_use]
-extern crate rustc_data_structures;
-#[macro_use]
-extern crate tracing;
-#[macro_use]
-extern crate smallvec;
+#![feature(try_trait_v2)]
+#![feature(try_trait_v2_yeet)]
+#![feature(type_alias_impl_trait)]
+#![feature(yeet_expr)]
+#![warn(unreachable_pub)]
+// tidy-alphabetical-end
 
 #[cfg(test)]
 mod tests;
@@ -74,25 +73,27 @@ mod tests;
 mod macros;
 
 #[macro_use]
-pub mod query;
-
-#[macro_use]
 pub mod arena;
-#[macro_use]
-pub mod dep_graph;
+pub mod error;
 pub mod hir;
+pub mod hooks;
 pub mod infer;
 pub mod lint;
+pub mod metadata;
 pub mod middle;
 pub mod mir;
 pub mod thir;
 pub mod traits;
 pub mod ty;
+pub mod util;
+mod values;
 
-pub mod util {
-    pub mod bug;
-    pub mod common;
-}
+#[macro_use]
+pub mod query;
+#[macro_use]
+pub mod dep_graph;
 
 // Allows macros to refer to this crate as `::rustc_middle`
 extern crate self as rustc_middle;
+
+rustc_fluent_macro::fluent_messages! { "../messages.ftl" }

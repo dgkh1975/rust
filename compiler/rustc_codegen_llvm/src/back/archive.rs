@@ -1,33 +1,23 @@
 //! A helper class for dealing with static archives
 
-use std::ffi::{CStr, CString};
-use std::io;
-use std::mem;
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::{Path, PathBuf};
-use std::ptr;
-use std::str;
+use std::{io, mem, ptr, str};
 
-use crate::llvm::archive_ro::{ArchiveRO, Child};
-use crate::llvm::{self, ArchiveKind, LLVMMachineType, LLVMRustCOFFShortExport};
-use rustc_codegen_ssa::back::archive::ArchiveBuilder;
-use rustc_data_structures::temp_dir::MaybeTempDir;
-use rustc_session::cstore::{DllCallingConvention, DllImport};
+use rustc_codegen_ssa::back::archive::{
+    ArArchiveBuilder, ArchiveBuildFailure, ArchiveBuilder, ArchiveBuilderBuilder,
+    DEFAULT_OBJECT_READER, ObjectReader, UnknownArchiveKind, try_extract_macho_fat_archive,
+};
 use rustc_session::Session;
 
-struct ArchiveConfig<'a> {
-    pub sess: &'a Session,
-    pub dst: PathBuf,
-    pub src: Option<PathBuf>,
-}
+use crate::llvm::archive_ro::{ArchiveRO, Child};
+use crate::llvm::{self, ArchiveKind};
 
 /// Helper for adding many files to an archive.
 #[must_use = "must call build() to finish building the archive"]
-pub struct LlvmArchiveBuilder<'a> {
-    config: ArchiveConfig<'a>,
-    removals: Vec<String>,
+pub(crate) struct LlvmArchiveBuilder<'a> {
+    sess: &'a Session,
     additions: Vec<Addition>,
-    should_update_symbols: bool,
-    src_archive: Option<Option<ArchiveRO>>,
 }
 
 enum Addition {
@@ -50,63 +40,19 @@ fn is_relevant_child(c: &Child<'_>) -> bool {
     }
 }
 
-fn archive_config<'a>(sess: &'a Session, output: &Path, input: Option<&Path>) -> ArchiveConfig<'a> {
-    ArchiveConfig { sess, dst: output.to_path_buf(), src: input.map(|p| p.to_path_buf()) }
-}
-
-/// Map machine type strings to values of LLVM's MachineTypes enum.
-fn llvm_machine_type(cpu: &str) -> LLVMMachineType {
-    match cpu {
-        "x86_64" => LLVMMachineType::AMD64,
-        "x86" => LLVMMachineType::I386,
-        "aarch64" => LLVMMachineType::ARM64,
-        "arm" => LLVMMachineType::ARM,
-        _ => panic!("unsupported cpu type {}", cpu),
-    }
-}
-
-impl<'a> ArchiveBuilder<'a> for LlvmArchiveBuilder<'a> {
-    /// Creates a new static archive, ready for modifying the archive specified
-    /// by `config`.
-    fn new(sess: &'a Session, output: &Path, input: Option<&Path>) -> LlvmArchiveBuilder<'a> {
-        let config = archive_config(sess, output, input);
-        LlvmArchiveBuilder {
-            config,
-            removals: Vec::new(),
-            additions: Vec::new(),
-            should_update_symbols: false,
-            src_archive: None,
+impl<'a> ArchiveBuilder for LlvmArchiveBuilder<'a> {
+    fn add_archive(
+        &mut self,
+        archive: &Path,
+        skip: Box<dyn FnMut(&str) -> bool + 'static>,
+    ) -> io::Result<()> {
+        let mut archive = archive.to_path_buf();
+        if self.sess.target.llvm_target.contains("-apple-macosx") {
+            if let Some(new_archive) = try_extract_macho_fat_archive(self.sess, &archive)? {
+                archive = new_archive
+            }
         }
-    }
-
-    /// Removes a file from this archive
-    fn remove_file(&mut self, file: &str) {
-        self.removals.push(file.to_string());
-    }
-
-    /// Lists all files in an archive
-    fn src_files(&mut self) -> Vec<String> {
-        if self.src_archive().is_none() {
-            return Vec::new();
-        }
-
-        let archive = self.src_archive.as_ref().unwrap().as_ref().unwrap();
-
-        archive
-            .iter()
-            .filter_map(|child| child.ok())
-            .filter(is_relevant_child)
-            .filter_map(|child| child.name())
-            .filter(|name| !self.removals.iter().any(|x| x == name))
-            .map(|name| name.to_owned())
-            .collect()
-    }
-
-    fn add_archive<F>(&mut self, archive: &Path, skip: F) -> io::Result<()>
-    where
-        F: FnMut(&str) -> bool + 'static,
-    {
-        let archive_ro = match ArchiveRO::open(archive) {
+        let archive_ro = match ArchiveRO::open(&archive) {
             Ok(ar) => ar,
             Err(e) => return Err(io::Error::new(io::ErrorKind::Other, e)),
         };
@@ -114,7 +60,7 @@ impl<'a> ArchiveBuilder<'a> for LlvmArchiveBuilder<'a> {
             return Ok(());
         }
         self.additions.push(Addition::Archive {
-            path: archive.to_path_buf(),
+            path: archive,
             archive: archive_ro,
             skip: Box::new(skip),
         });
@@ -128,145 +74,112 @@ impl<'a> ArchiveBuilder<'a> for LlvmArchiveBuilder<'a> {
             .push(Addition::File { path: file.to_path_buf(), name_in_archive: name.to_owned() });
     }
 
-    /// Indicate that the next call to `build` should update all symbols in
-    /// the archive (equivalent to running 'ar s' over it).
-    fn update_symbols(&mut self) {
-        self.should_update_symbols = true;
-    }
-
     /// Combine the provided files, rlibs, and native libraries into a single
     /// `Archive`.
-    fn build(mut self) {
-        let kind = self.llvm_archive_kind().unwrap_or_else(|kind| {
-            self.config.sess.fatal(&format!("Don't know how to build archive of type: {}", kind))
-        });
-
-        if let Err(e) = self.build_with_llvm(kind) {
-            self.config.sess.fatal(&format!("failed to build archive: {}", e));
+    fn build(mut self: Box<Self>, output: &Path) -> bool {
+        match self.build_with_llvm(output) {
+            Ok(any_members) => any_members,
+            Err(error) => {
+                self.sess.dcx().emit_fatal(ArchiveBuildFailure { path: output.to_owned(), error })
+            }
         }
-    }
-
-    fn inject_dll_import_lib(
-        &mut self,
-        lib_name: &str,
-        dll_imports: &[DllImport],
-        tmpdir: &MaybeTempDir,
-    ) {
-        let output_path = {
-            let mut output_path: PathBuf = tmpdir.as_ref().to_path_buf();
-            output_path.push(format!("{}_imports", lib_name));
-            output_path.with_extension("lib")
-        };
-
-        // we've checked for \0 characters in the library name already
-        let dll_name_z = CString::new(lib_name).unwrap();
-        // All import names are Rust identifiers and therefore cannot contain \0 characters.
-        // FIXME: when support for #[link_name] implemented, ensure that import.name values don't
-        // have any \0 characters
-        let import_name_and_ordinal_vector: Vec<(CString, Option<u16>)> = dll_imports
-            .iter()
-            .map(|import: &DllImport| {
-                if self.config.sess.target.arch == "x86" {
-                    (LlvmArchiveBuilder::i686_decorated_name(import), import.ordinal)
-                } else {
-                    (CString::new(import.name.to_string()).unwrap(), import.ordinal)
-                }
-            })
-            .collect();
-
-        let output_path_z = rustc_fs_util::path_to_c_string(&output_path);
-
-        tracing::trace!("invoking LLVMRustWriteImportLibrary");
-        tracing::trace!("  dll_name {:#?}", dll_name_z);
-        tracing::trace!("  output_path {}", output_path.display());
-        tracing::trace!(
-            "  import names: {}",
-            dll_imports.iter().map(|import| import.name.to_string()).collect::<Vec<_>>().join(", "),
-        );
-
-        let ffi_exports: Vec<LLVMRustCOFFShortExport> = import_name_and_ordinal_vector
-            .iter()
-            .map(|(name_z, ordinal)| LLVMRustCOFFShortExport::new(name_z.as_ptr(), *ordinal))
-            .collect();
-        let result = unsafe {
-            crate::llvm::LLVMRustWriteImportLibrary(
-                dll_name_z.as_ptr(),
-                output_path_z.as_ptr(),
-                ffi_exports.as_ptr(),
-                ffi_exports.len(),
-                llvm_machine_type(&self.config.sess.target.arch) as u16,
-                !self.config.sess.target.is_like_msvc,
-            )
-        };
-
-        if result == crate::llvm::LLVMRustResult::Failure {
-            self.config.sess.fatal(&format!(
-                "Error creating import library for {}: {}",
-                lib_name,
-                llvm::last_error().unwrap_or("unknown LLVM error".to_string())
-            ));
-        }
-
-        self.add_archive(&output_path, |_| false).unwrap_or_else(|e| {
-            self.config.sess.fatal(&format!(
-                "failed to add native library {}: {}",
-                output_path.display(),
-                e
-            ));
-        });
     }
 }
 
-impl<'a> LlvmArchiveBuilder<'a> {
-    fn src_archive(&mut self) -> Option<&ArchiveRO> {
-        if let Some(ref a) = self.src_archive {
-            return a.as_ref();
+pub(crate) struct LlvmArchiveBuilderBuilder;
+
+impl ArchiveBuilderBuilder for LlvmArchiveBuilderBuilder {
+    fn new_archive_builder<'a>(&self, sess: &'a Session) -> Box<dyn ArchiveBuilder + 'a> {
+        // Keeping LlvmArchiveBuilder around in case of a regression caused by using
+        // ArArchiveBuilder.
+        // FIXME(#128955) remove a couple of months after #128936 gets merged in case
+        // no regression is found.
+        if false {
+            Box::new(LlvmArchiveBuilder { sess, additions: Vec::new() })
+        } else {
+            Box::new(ArArchiveBuilder::new(sess, &LLVM_OBJECT_READER))
         }
-        let src = self.config.src.as_ref()?;
-        self.src_archive = Some(ArchiveRO::open(src).ok());
-        self.src_archive.as_ref().unwrap().as_ref()
+    }
+}
+
+// The object crate doesn't know how to get symbols for LLVM bitcode and COFF bigobj files.
+// As such we need to use LLVM for them.
+
+static LLVM_OBJECT_READER: ObjectReader = ObjectReader {
+    get_symbols: get_llvm_object_symbols,
+    is_64_bit_object_file: llvm_is_64_bit_object_file,
+    is_ec_object_file: llvm_is_ec_object_file,
+    get_xcoff_member_alignment: DEFAULT_OBJECT_READER.get_xcoff_member_alignment,
+};
+
+#[deny(unsafe_op_in_unsafe_fn)]
+fn get_llvm_object_symbols(
+    buf: &[u8],
+    f: &mut dyn FnMut(&[u8]) -> io::Result<()>,
+) -> io::Result<bool> {
+    let mut state = Box::new(f);
+
+    let err = unsafe {
+        llvm::LLVMRustGetSymbols(
+            buf.as_ptr(),
+            buf.len(),
+            (&raw mut *state) as *mut c_void,
+            callback,
+            error_callback,
+        )
+    };
+
+    if err.is_null() {
+        return Ok(true);
+    } else {
+        return Err(unsafe { *Box::from_raw(err as *mut io::Error) });
     }
 
-    fn llvm_archive_kind(&self) -> Result<ArchiveKind, &str> {
-        let kind = &*self.config.sess.target.archive_format;
-        kind.parse().map_err(|_| kind)
+    unsafe extern "C" fn callback(state: *mut c_void, symbol_name: *const c_char) -> *mut c_void {
+        let f = unsafe { &mut *(state as *mut &mut dyn FnMut(&[u8]) -> io::Result<()>) };
+        match f(unsafe { CStr::from_ptr(symbol_name) }.to_bytes()) {
+            Ok(()) => std::ptr::null_mut(),
+            Err(err) => Box::into_raw(Box::new(err)) as *mut c_void,
+        }
     }
 
-    fn build_with_llvm(&mut self, kind: ArchiveKind) -> io::Result<()> {
-        let removals = mem::take(&mut self.removals);
+    unsafe extern "C" fn error_callback(error: *const c_char) -> *mut c_void {
+        let error = unsafe { CStr::from_ptr(error) };
+        Box::into_raw(Box::new(io::Error::new(
+            io::ErrorKind::Other,
+            format!("LLVM error: {}", error.to_string_lossy()),
+        ))) as *mut c_void
+    }
+}
+
+fn llvm_is_64_bit_object_file(buf: &[u8]) -> bool {
+    unsafe { llvm::LLVMRustIs64BitSymbolicFile(buf.as_ptr(), buf.len()) }
+}
+
+fn llvm_is_ec_object_file(buf: &[u8]) -> bool {
+    unsafe { llvm::LLVMRustIsECObject(buf.as_ptr(), buf.len()) }
+}
+
+impl<'a> LlvmArchiveBuilder<'a> {
+    fn build_with_llvm(&mut self, output: &Path) -> io::Result<bool> {
+        let kind = &*self.sess.target.archive_format;
+        let kind = kind
+            .parse::<ArchiveKind>()
+            .map_err(|_| kind)
+            .unwrap_or_else(|kind| self.sess.dcx().emit_fatal(UnknownArchiveKind { kind }));
+
         let mut additions = mem::take(&mut self.additions);
         let mut strings = Vec::new();
         let mut members = Vec::new();
 
-        let dst = CString::new(self.config.dst.to_str().unwrap())?;
-        let should_update_symbols = self.should_update_symbols;
+        let dst = CString::new(output.to_str().unwrap())?;
 
         unsafe {
-            if let Some(archive) = self.src_archive() {
-                for child in archive.iter() {
-                    let child = child.map_err(string_to_io_error)?;
-                    let child_name = match child.name() {
-                        Some(s) => s,
-                        None => continue,
-                    };
-                    if removals.iter().any(|r| r == child_name) {
-                        continue;
-                    }
-
-                    let name = CString::new(child_name)?;
-                    members.push(llvm::LLVMRustArchiveMemberNew(
-                        ptr::null(),
-                        name.as_ptr(),
-                        Some(child.raw),
-                    ));
-                    strings.push(name);
-                }
-            }
             for addition in &mut additions {
                 match addition {
                     Addition::File { path, name_in_archive } => {
                         let path = CString::new(path.to_str().unwrap())?;
-                        let name = CString::new(name_in_archive.clone())?;
+                        let name = CString::new(name_in_archive.as_bytes())?;
                         members.push(llvm::LLVMRustArchiveMemberNew(
                             path.as_ptr(),
                             name.as_ptr(),
@@ -311,8 +224,9 @@ impl<'a> LlvmArchiveBuilder<'a> {
                 dst.as_ptr(),
                 members.len() as libc::size_t,
                 members.as_ptr() as *const &_,
-                should_update_symbols,
+                true,
                 kind,
+                self.sess.target.arch == "arm64ec",
             );
             let ret = if r.into_result().is_err() {
                 let err = llvm::LLVMRustGetLastError();
@@ -323,7 +237,7 @@ impl<'a> LlvmArchiveBuilder<'a> {
                 };
                 Err(io::Error::new(io::ErrorKind::Other, msg))
             } else {
-                Ok(())
+                Ok(!members.is_empty())
             };
             for member in members {
                 llvm::LLVMRustArchiveMemberFree(member);
@@ -331,23 +245,8 @@ impl<'a> LlvmArchiveBuilder<'a> {
             ret
         }
     }
-
-    fn i686_decorated_name(import: &DllImport) -> CString {
-        let name = import.name;
-        // We verified during construction that `name` does not contain any NULL characters, so the
-        // conversion to CString is guaranteed to succeed.
-        CString::new(match import.calling_convention {
-            DllCallingConvention::C => format!("_{}", name),
-            DllCallingConvention::Stdcall(arg_list_size) => format!("_{}@{}", name, arg_list_size),
-            DllCallingConvention::Fastcall(arg_list_size) => format!("@{}@{}", name, arg_list_size),
-            DllCallingConvention::Vectorcall(arg_list_size) => {
-                format!("{}@@{}", name, arg_list_size)
-            }
-        })
-        .unwrap()
-    }
 }
 
 fn string_to_io_error(s: String) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, format!("bad archive: {}", s))
+    io::Error::new(io::ErrorKind::Other, format!("bad archive: {s}"))
 }

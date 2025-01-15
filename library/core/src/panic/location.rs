@@ -2,9 +2,10 @@ use crate::fmt;
 
 /// A struct containing information about the location of a panic.
 ///
-/// This structure is created by [`PanicInfo::location()`].
+/// This structure is created by [`PanicHookInfo::location()`] and [`PanicInfo::location()`].
 ///
 /// [`PanicInfo::location()`]: crate::panic::PanicInfo::location
+/// [`PanicHookInfo::location()`]: ../../std/panic/struct.PanicHookInfo.html#method.location
 ///
 /// # Examples
 ///
@@ -43,7 +44,7 @@ impl<'a> Location<'a> {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```standalone_crate
     /// use std::panic::Location;
     ///
     /// /// Returns the [`Location`] at which it is called.
@@ -79,9 +80,11 @@ impl<'a> Location<'a> {
     /// assert_ne!(this_location.line(), another_location.line());
     /// assert_ne!(this_location.column(), another_location.column());
     /// ```
+    #[must_use]
     #[stable(feature = "track_caller", since = "1.46.0")]
-    #[rustc_const_unstable(feature = "const_caller_location", issue = "76156")]
+    #[rustc_const_stable(feature = "const_caller_location", since = "1.79.0")]
     #[track_caller]
+    #[inline]
     pub const fn caller() -> &'static Location<'static> {
         crate::intrinsics::caller_location()
     }
@@ -119,8 +122,11 @@ impl<'a> Location<'a> {
     ///
     /// panic!("Normal panic");
     /// ```
+    #[must_use]
     #[stable(feature = "panic_hooks", since = "1.10.0")]
-    pub fn file(&self) -> &str {
+    #[rustc_const_stable(feature = "const_location_fields", since = "1.79.0")]
+    #[inline]
+    pub const fn file(&self) -> &str {
         self.file
     }
 
@@ -141,8 +147,11 @@ impl<'a> Location<'a> {
     ///
     /// panic!("Normal panic");
     /// ```
+    #[must_use]
     #[stable(feature = "panic_hooks", since = "1.10.0")]
-    pub fn line(&self) -> u32 {
+    #[rustc_const_stable(feature = "const_location_fields", since = "1.79.0")]
+    #[inline]
+    pub const fn line(&self) -> u32 {
         self.line
     }
 
@@ -163,8 +172,11 @@ impl<'a> Location<'a> {
     ///
     /// panic!("Normal panic");
     /// ```
+    #[must_use]
     #[stable(feature = "panic_col", since = "1.25.0")]
-    pub fn column(&self) -> u32 {
+    #[rustc_const_stable(feature = "const_location_fields", since = "1.79.0")]
+    #[inline]
+    pub const fn column(&self) -> u32 {
         self.col
     }
 }
@@ -183,6 +195,7 @@ impl<'a> Location<'a> {
 
 #[stable(feature = "panic_hook_display", since = "1.26.0")]
 impl fmt::Display for Location<'_> {
+    #[inline]
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{}:{}:{}", self.file, self.line, self.col)
     }

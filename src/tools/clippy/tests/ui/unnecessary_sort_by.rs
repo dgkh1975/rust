@@ -1,8 +1,6 @@
-// run-rustfix
+#![allow(clippy::stable_sort_primitive, clippy::useless_vec)]
 
-#![allow(clippy::stable_sort_primitive)]
-
-use std::cmp::Reverse;
+use std::cell::Ref;
 
 fn unnecessary_sort_by() {
     fn id(x: isize) -> isize {
@@ -33,6 +31,10 @@ fn unnecessary_sort_by() {
     // `Reverse(b)` would borrow in the following cases, don't lint
     vec.sort_by(|a, b| b.cmp(a));
     vec.sort_unstable_by(|a, b| b.cmp(a));
+
+    // No warning if element does not implement `Ord`
+    let mut vec: Vec<Ref<usize>> = Vec::new();
+    vec.sort_unstable_by(|a, b| a.cmp(b));
 }
 
 // Do not suggest returning a reference to the closure parameter of `Vec::sort_by_key`
@@ -71,7 +73,6 @@ mod issue_5754 {
 
 // The closure parameter is not dereferenced anymore, so non-Copy types can be linted
 mod issue_6001 {
-    use super::*;
     struct Test(String);
 
     impl Test {

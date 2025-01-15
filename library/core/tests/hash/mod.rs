@@ -1,17 +1,12 @@
 mod sip;
 
-use std::default::Default;
 use std::hash::{BuildHasher, Hash, Hasher};
+use std::ptr;
 use std::rc::Rc;
 
+#[derive(Default)]
 struct MyHasher {
     hash: u64,
-}
-
-impl Default for MyHasher {
-    fn default() -> MyHasher {
-        MyHasher { hash: 0 }
-    }
 }
 
 impl Hasher for MyHasher {
@@ -20,6 +15,10 @@ impl Hasher for MyHasher {
             self.hash += *byte as u64;
         }
     }
+    fn write_str(&mut self, s: &str) {
+        self.write(s.as_bytes());
+        self.write_u8(0xFF);
+    }
     fn finish(&self) -> u64 {
         self.hash
     }
@@ -27,11 +26,26 @@ impl Hasher for MyHasher {
 
 #[test]
 fn test_writer_hasher() {
+    // FIXME(#110395)
+    /* const */
     fn hash<T: Hash>(t: &T) -> u64 {
         let mut s = MyHasher { hash: 0 };
         t.hash(&mut s);
         s.finish()
     }
+
+    /* const {
+        // FIXME(fee1-dead): assert_eq
+        assert!(hash(&()) == 0);
+        assert!(hash(&5_u8) == 5);
+        assert!(hash(&5_u16) == 5);
+        assert!(hash(&5_u32) == 5);
+
+        assert!(hash(&'a') == 97);
+
+        let s: &str = "a";
+        assert!(hash(&s) == 97 + 0xFF);
+    }; */
 
     assert_eq!(hash(&()), 0);
 
@@ -65,10 +79,10 @@ fn test_writer_hasher() {
     let cs: Rc<[u8]> = Rc::new([1, 2, 3]);
     assert_eq!(hash(&cs), 9);
 
-    let ptr = 5_usize as *const i32;
+    let ptr = ptr::without_provenance::<i32>(5_usize);
     assert_eq!(hash(&ptr), 5);
 
-    let ptr = 5_usize as *mut i32;
+    let ptr = ptr::without_provenance_mut::<i32>(5_usize);
     assert_eq!(hash(&ptr), 5);
 
     if cfg!(miri) {
@@ -88,6 +102,8 @@ fn test_writer_hasher() {
 struct Custom {
     hash: u64,
 }
+
+#[derive(Default)]
 struct CustomHasher {
     output: u64,
 }
@@ -104,12 +120,6 @@ impl Hasher for CustomHasher {
     }
 }
 
-impl Default for CustomHasher {
-    fn default() -> CustomHasher {
-        CustomHasher { output: 0 }
-    }
-}
-
 impl Hash for Custom {
     fn hash<H: Hasher>(&self, state: &mut H) {
         state.write_u64(self.hash);
@@ -118,6 +128,8 @@ impl Hash for Custom {
 
 #[test]
 fn test_custom_state() {
+    // FIXME(#110395)
+    /* const */
     fn hash<T: Hash>(t: &T) -> u64 {
         let mut c = CustomHasher { output: 0 };
         t.hash(&mut c);
@@ -125,6 +137,8 @@ fn test_custom_state() {
     }
 
     assert_eq!(hash(&Custom { hash: 5 }), 5);
+
+    // const { assert!(hash(&Custom { hash: 6 }) == 6) };
 }
 
 // FIXME: Instantiated functions with i128 in the signature is not supported in Emscripten.
@@ -141,8 +155,16 @@ fn test_indirect_hasher() {
 }
 
 #[test]
-fn test_build_hasher_object_safe() {
-    use std::collections::hash_map::{DefaultHasher, RandomState};
+fn test_build_hasher_dyn_compatible() {
+    use std::hash::{DefaultHasher, RandomState};
 
     let _: &dyn BuildHasher<Hasher = DefaultHasher> = &RandomState::new();
+}
+
+// just tests by whether or not this compiles
+fn _build_hasher_default_impl_all_auto_traits<T>() {
+    use std::panic::{RefUnwindSafe, UnwindSafe};
+    fn all_auto_traits<T: Send + Sync + Unpin + UnwindSafe + RefUnwindSafe>() {}
+
+    all_auto_traits::<std::hash::BuildHasherDefault<T>>();
 }

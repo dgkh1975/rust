@@ -1,5 +1,9 @@
-// run-rustfix
 #![warn(clippy::suboptimal_flops)]
+
+/// Allow suboptimal ops in constant context
+pub const fn in_const_context(num: f64) -> f64 {
+    if num >= 0.0 { num } else { -num }
+}
 
 struct A {
     a: f64,

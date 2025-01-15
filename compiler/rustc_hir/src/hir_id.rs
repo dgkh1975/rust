@@ -1,6 +1,70 @@
-use crate::def_id::{LocalDefId, CRATE_DEF_INDEX};
-use rustc_index::vec::IndexVec;
-use std::fmt;
+use std::fmt::{self, Debug};
+
+use rustc_data_structures::stable_hasher::{HashStable, StableHasher, StableOrd, ToStableHashKey};
+use rustc_macros::{Decodable, Encodable, HashStable_Generic};
+use rustc_span::HashStableContext;
+use rustc_span::def_id::DefPathHash;
+
+use crate::def_id::{CRATE_DEF_ID, DefId, DefIndex, LocalDefId};
+
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Encodable, Decodable)]
+pub struct OwnerId {
+    pub def_id: LocalDefId,
+}
+
+impl Debug for OwnerId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Example: DefId(0:1 ~ aa[7697]::{use#0})
+        Debug::fmt(&self.def_id, f)
+    }
+}
+
+impl From<OwnerId> for HirId {
+    fn from(owner: OwnerId) -> HirId {
+        HirId { owner, local_id: ItemLocalId::ZERO }
+    }
+}
+
+impl From<OwnerId> for DefId {
+    fn from(value: OwnerId) -> Self {
+        value.to_def_id()
+    }
+}
+
+impl OwnerId {
+    #[inline]
+    pub fn to_def_id(self) -> DefId {
+        self.def_id.to_def_id()
+    }
+}
+
+impl rustc_index::Idx for OwnerId {
+    #[inline]
+    fn new(idx: usize) -> Self {
+        OwnerId { def_id: LocalDefId { local_def_index: DefIndex::from_usize(idx) } }
+    }
+
+    #[inline]
+    fn index(self) -> usize {
+        self.def_id.local_def_index.as_usize()
+    }
+}
+
+impl<CTX: HashStableContext> HashStable<CTX> for OwnerId {
+    #[inline]
+    fn hash_stable(&self, hcx: &mut CTX, hasher: &mut StableHasher) {
+        self.to_stable_hash_key(hcx).hash_stable(hcx, hasher);
+    }
+}
+
+impl<CTX: HashStableContext> ToStableHashKey<CTX> for OwnerId {
+    type KeyType = DefPathHash;
+
+    #[inline]
+    fn to_stable_hash_key(&self, hcx: &CTX) -> DefPathHash {
+        hcx.def_path_hash(self.to_def_id())
+    }
+}
 
 /// Uniquely identifies a node in the HIR of the current crate. It is
 /// composed of the `owner`, which is the `LocalDefId` of the directly enclosing
@@ -12,120 +76,108 @@ use std::fmt;
 /// the `local_id` part of the `HirId` changing, which is a very useful property in
 /// incremental compilation where we have to persist things through changes to
 /// the code base.
-#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
-#[derive(Encodable, Decodable)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Encodable, Decodable, HashStable_Generic)]
+#[rustc_pass_by_value]
 pub struct HirId {
-    pub owner: LocalDefId,
+    pub owner: OwnerId,
     pub local_id: ItemLocalId,
 }
 
+impl Debug for HirId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Example: HirId(DefId(0:1 ~ aa[7697]::{use#0}).10)
+        // Don't use debug_tuple to always keep this on one line.
+        write!(f, "HirId({:?}.{:?})", self.owner, self.local_id)
+    }
+}
+
 impl HirId {
-    pub fn expect_owner(self) -> LocalDefId {
+    /// Signal local id which should never be used.
+    pub const INVALID: HirId =
+        HirId { owner: OwnerId { def_id: CRATE_DEF_ID }, local_id: ItemLocalId::INVALID };
+
+    #[inline]
+    pub fn expect_owner(self) -> OwnerId {
         assert_eq!(self.local_id.index(), 0);
         self.owner
     }
 
-    pub fn as_owner(self) -> Option<LocalDefId> {
+    #[inline]
+    pub fn as_owner(self) -> Option<OwnerId> {
         if self.local_id.index() == 0 { Some(self.owner) } else { None }
     }
 
     #[inline]
+    pub fn is_owner(self) -> bool {
+        self.local_id.index() == 0
+    }
+
+    #[inline]
     pub fn make_owner(owner: LocalDefId) -> Self {
-        Self { owner, local_id: ItemLocalId::from_u32(0) }
+        Self { owner: OwnerId { def_id: owner }, local_id: ItemLocalId::ZERO }
+    }
+
+    pub fn index(self) -> (usize, usize) {
+        (rustc_index::Idx::index(self.owner.def_id), rustc_index::Idx::index(self.local_id))
     }
 }
 
 impl fmt::Display for HirId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
 
-rustc_data_structures::define_id_collections!(HirIdMap, HirIdSet, HirId);
-rustc_data_structures::define_id_collections!(ItemLocalMap, ItemLocalSet, ItemLocalId);
+impl Ord for HirId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.index()).cmp(&(other.index()))
+    }
+}
+
+impl PartialOrd for HirId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+rustc_data_structures::define_stable_id_collections!(HirIdMap, HirIdSet, HirIdMapEntry, HirId);
+rustc_data_structures::define_id_collections!(
+    ItemLocalMap,
+    ItemLocalSet,
+    ItemLocalMapEntry,
+    ItemLocalId
+);
 
 rustc_index::newtype_index! {
     /// An `ItemLocalId` uniquely identifies something within a given "item-like";
     /// that is, within a `hir::Item`, `hir::TraitItem`, or `hir::ImplItem`. There is no
     /// guarantee that the numerical value of a given `ItemLocalId` corresponds to
     /// the node's position within the owning item in any way, but there is a
-    /// guarantee that the `LocalItemId`s within an owner occupy a dense range of
+    /// guarantee that the `ItemLocalId`s within an owner occupy a dense range of
     /// integers starting at zero, so a mapping that maps all or most nodes within
     /// an "item-like" to something else can be implemented by a `Vec` instead of a
     /// tree or hash map.
-    pub struct ItemLocalId { .. }
-}
-rustc_data_structures::impl_stable_hash_via_hash!(ItemLocalId);
-
-/// The `HirId` corresponding to `CRATE_NODE_ID` and `CRATE_DEF_INDEX`.
-pub const CRATE_HIR_ID: HirId = HirId {
-    owner: LocalDefId { local_def_index: CRATE_DEF_INDEX },
-    local_id: ItemLocalId::from_u32(0),
-};
-
-/// N.B. This collection is currently unused, but will be used by #72015 and future PRs.
-#[derive(Clone, Default, Debug, Encodable, Decodable)]
-pub struct HirIdVec<T> {
-    map: IndexVec<LocalDefId, IndexVec<ItemLocalId, T>>,
+    #[derive(HashStable_Generic)]
+    #[encodable]
+    #[orderable]
+    pub struct ItemLocalId {}
 }
 
-impl<T> HirIdVec<T> {
-    pub fn push_owner(&mut self, id: LocalDefId) {
-        self.map.ensure_contains_elem(id, IndexVec::new);
-    }
-
-    pub fn push(&mut self, id: HirId, value: T) {
-        if id.local_id == ItemLocalId::from_u32(0) {
-            self.push_owner(id.owner);
-        }
-        let submap = &mut self.map[id.owner];
-        let _ret_id = submap.push(value);
-        debug_assert_eq!(_ret_id, id.local_id);
-    }
-
-    pub fn push_sparse(&mut self, id: HirId, value: T)
-    where
-        T: Default,
-    {
-        self.map.ensure_contains_elem(id.owner, IndexVec::new);
-        let submap = &mut self.map[id.owner];
-        let i = id.local_id.index();
-        let len = submap.len();
-        if i >= len {
-            submap.extend(std::iter::repeat_with(T::default).take(i - len + 1));
-        }
-        submap[id.local_id] = value;
-    }
-
-    pub fn get(&self, id: HirId) -> Option<&T> {
-        self.map.get(id.owner)?.get(id.local_id)
-    }
-
-    pub fn get_owner(&self, id: LocalDefId) -> &IndexVec<ItemLocalId, T> {
-        &self.map[id]
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = &T> {
-        self.map.iter().flat_map(|la| la.iter())
-    }
-
-    pub fn iter_enumerated(&self) -> impl Iterator<Item = (HirId, &T)> {
-        self.map.iter_enumerated().flat_map(|(owner, la)| {
-            la.iter_enumerated().map(move |(local_id, attr)| (HirId { owner, local_id }, attr))
-        })
-    }
+impl ItemLocalId {
+    /// Signal local id which should never be used.
+    pub const INVALID: ItemLocalId = ItemLocalId::MAX;
 }
 
-impl<T> std::ops::Index<HirId> for HirIdVec<T> {
-    type Output = T;
+impl StableOrd for ItemLocalId {
+    const CAN_USE_UNSTABLE_SORT: bool = true;
 
-    fn index(&self, id: HirId) -> &T {
-        &self.map[id.owner][id.local_id]
-    }
+    // `Ord` is implemented as just comparing the ItemLocalId's numerical
+    // values and these are not changed by (de-)serialization.
+    const THIS_IMPLEMENTATION_HAS_BEEN_TRIPLE_CHECKED: () = ();
 }
 
-impl<T> std::ops::IndexMut<HirId> for HirIdVec<T> {
-    fn index_mut(&mut self, id: HirId) -> &mut T {
-        &mut self.map[id.owner][id.local_id]
-    }
-}
+/// The `HirId` corresponding to `CRATE_NODE_ID` and `CRATE_DEF_ID`.
+pub const CRATE_HIR_ID: HirId =
+    HirId { owner: OwnerId { def_id: CRATE_DEF_ID }, local_id: ItemLocalId::ZERO };
+
+pub const CRATE_OWNER_ID: OwnerId = OwnerId { def_id: CRATE_DEF_ID };

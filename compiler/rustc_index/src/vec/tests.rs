@@ -1,5 +1,11 @@
-#![allow(dead_code)]
-newtype_index!(struct MyIdx { MAX = 0xFFFF_FFFA });
+// Allows the macro invocation below to work
+use crate as rustc_index;
+
+crate::newtype_index! {
+    #[orderable]
+    #[max = 0xFFFF_FFFA]
+    struct MyIdx {}
+}
 
 #[test]
 fn index_size_is_optimized() {
@@ -23,19 +29,21 @@ fn index_size_is_optimized() {
 #[test]
 fn range_iterator_iterates_forwards() {
     let range = MyIdx::from_u32(1)..MyIdx::from_u32(4);
-    assert_eq!(
-        range.collect::<Vec<_>>(),
-        [MyIdx::from_u32(1), MyIdx::from_u32(2), MyIdx::from_u32(3)]
-    );
+    assert_eq!(range.collect::<Vec<_>>(), [
+        MyIdx::from_u32(1),
+        MyIdx::from_u32(2),
+        MyIdx::from_u32(3)
+    ]);
 }
 
 #[test]
 fn range_iterator_iterates_backwards() {
     let range = MyIdx::from_u32(1)..MyIdx::from_u32(4);
-    assert_eq!(
-        range.rev().collect::<Vec<_>>(),
-        [MyIdx::from_u32(3), MyIdx::from_u32(2), MyIdx::from_u32(1)]
-    );
+    assert_eq!(range.rev().collect::<Vec<_>>(), [
+        MyIdx::from_u32(3),
+        MyIdx::from_u32(2),
+        MyIdx::from_u32(1)
+    ]);
 }
 
 #[test]

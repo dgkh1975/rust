@@ -1,12 +1,11 @@
-use clippy_utils::diagnostics::span_lint;
+use clippy_utils::diagnostics::{span_lint, span_lint_hir};
 use clippy_utils::higher;
 use rustc_hir as hir;
 use rustc_hir::intravisit;
 use rustc_lint::{LateContext, LateLintPass, LintContext};
-use rustc_middle::hir::map::Map;
 use rustc_middle::lint::in_external_macro;
 use rustc_middle::ty;
-use rustc_session::{declare_lint_pass, declare_tool_lint};
+use rustc_session::declare_lint_pass;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -18,10 +17,11 @@ declare_clippy_lint! {
     /// misunderstanding of references.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// # let mut y = 1;
     /// let x = &mut &mut y;
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub MUT_MUT,
     pedantic,
     "usage of double-mut refs, e.g., `&mut &mut ...`"
@@ -35,9 +35,19 @@ impl<'tcx> LateLintPass<'tcx> for MutMut {
     }
 
     fn check_ty(&mut self, cx: &LateContext<'tcx>, ty: &'tcx hir::Ty<'_>) {
-        use rustc_hir::intravisit::Visitor;
-
-        MutVisitor { cx }.visit_ty(ty);
+        if let hir::TyKind::Ref(_, mty) = ty.kind
+            && mty.mutbl == hir::Mutability::Mut
+            && let hir::TyKind::Ref(_, mty) = mty.ty.kind
+            && mty.mutbl == hir::Mutability::Mut
+            && !in_external_macro(cx.sess(), ty.span)
+        {
+            span_lint(
+                cx,
+                MUT_MUT,
+                ty.span,
+                "generally you want to avoid `&mut &mut _` if possible",
+            );
+        }
     }
 }
 
@@ -45,9 +55,7 @@ pub struct MutVisitor<'a, 'tcx> {
     cx: &'a LateContext<'tcx>,
 }
 
-impl<'a, 'tcx> intravisit::Visitor<'tcx> for MutVisitor<'a, 'tcx> {
-    type Map = Map<'tcx>;
-
+impl<'tcx> intravisit::Visitor<'tcx> for MutVisitor<'_, 'tcx> {
     fn visit_expr(&mut self, expr: &'tcx hir::Expr<'_>) {
         if in_external_macro(self.cx.sess(), expr.span) {
             return;
@@ -64,52 +72,24 @@ impl<'a, 'tcx> intravisit::Visitor<'tcx> for MutVisitor<'a, 'tcx> {
             intravisit::walk_expr(self, body);
         } else if let hir::ExprKind::AddrOf(hir::BorrowKind::Ref, hir::Mutability::Mut, e) = expr.kind {
             if let hir::ExprKind::AddrOf(hir::BorrowKind::Ref, hir::Mutability::Mut, _) = e.kind {
-                span_lint(
+                span_lint_hir(
                     self.cx,
                     MUT_MUT,
+                    expr.hir_id,
                     expr.span,
                     "generally you want to avoid `&mut &mut _` if possible",
                 );
-            } else if let ty::Ref(_, _, hir::Mutability::Mut) = self.cx.typeck_results().expr_ty(e).kind() {
-                span_lint(
-                    self.cx,
-                    MUT_MUT,
-                    expr.span,
-                    "this expression mutably borrows a mutable reference. Consider reborrowing",
-                );
+            } else if let ty::Ref(_, ty, hir::Mutability::Mut) = self.cx.typeck_results().expr_ty(e).kind() {
+                if ty.peel_refs().is_sized(self.cx.tcx, self.cx.typing_env()) {
+                    span_lint_hir(
+                        self.cx,
+                        MUT_MUT,
+                        expr.hir_id,
+                        expr.span,
+                        "this expression mutably borrows a mutable reference. Consider reborrowing",
+                    );
+                }
             }
         }
-    }
-
-    fn visit_ty(&mut self, ty: &'tcx hir::Ty<'_>) {
-        if let hir::TyKind::Rptr(
-            _,
-            hir::MutTy {
-                ty: pty,
-                mutbl: hir::Mutability::Mut,
-            },
-        ) = ty.kind
-        {
-            if let hir::TyKind::Rptr(
-                _,
-                hir::MutTy {
-                    mutbl: hir::Mutability::Mut,
-                    ..
-                },
-            ) = pty.kind
-            {
-                span_lint(
-                    self.cx,
-                    MUT_MUT,
-                    ty.span,
-                    "generally you want to avoid `&mut &mut _` if possible",
-                );
-            }
-        }
-
-        intravisit::walk_ty(self, ty);
-    }
-    fn nested_visit_map(&mut self) -> intravisit::NestedVisitorMap<Self::Map> {
-        intravisit::NestedVisitorMap::None
     }
 }

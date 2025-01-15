@@ -2,10 +2,11 @@
 
 //! ncurses-compatible compiled terminfo format parsing (term(5))
 
-use super::super::TermInfo;
 use std::collections::HashMap;
 use std::io;
 use std::io::prelude::*;
+
+use super::super::TermInfo;
 
 #[cfg(test)]
 mod tests;
@@ -198,7 +199,7 @@ pub(crate) fn parse(file: &mut dyn io::Read, longnames: bool) -> Result<TermInfo
     let extended = match magic {
         0o0432 => false,
         0o01036 => true,
-        _ => return Err(format!("invalid magic number, found {:o}", magic)),
+        _ => return Err(format!("invalid magic number, found {magic:o}")),
     };
 
     // According to the spec, these fields must be >= -1 where -1 means that the feature is not

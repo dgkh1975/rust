@@ -52,18 +52,18 @@ rustdoc 1.17.0 (56124baa9 2017-04-24)
 binary: rustdoc
 commit-hash: hash
 commit-date: date
-host: host-triple
+host: host-tuple
 release: 1.17.0
 LLVM version: 3.9
 ```
 
-## `-o`/`--output`: output path
+## `-o`/`--out-dir`: output directory path
 
 Using this flag looks like this:
 
 ```bash
 $ rustdoc src/lib.rs -o target/doc
-$ rustdoc src/lib.rs --output target/doc
+$ rustdoc src/lib.rs --out-dir target/doc
 ```
 
 By default, `rustdoc`'s output appears in a directory named `doc` in
@@ -131,6 +131,20 @@ This flag accepts the same values as `rustc --cfg`, and uses it to configure
 compilation. The example above uses `feature`, but any of the `cfg` values
 are acceptable.
 
+## `--check-cfg`: check configuration flags
+
+This flag accepts the same values as `rustc --check-cfg`, and uses it to
+check configuration flags.
+
+Using this flag looks like this:
+
+```bash
+$ rustdoc src/lib.rs --check-cfg='cfg(my_cfg, values("foo", "bar"))'
+```
+
+The example above check every well known names and values (`target_os`, `doc`, `test`, ...)
+and check the values of `my_cfg`: `foo` and `bar`.
+
 ## `--extern`: specify a dependency's location
 
 Using this flag looks like this:
@@ -177,9 +191,9 @@ $ rustdoc src/lib.rs --test
 ```
 
 This flag will run your code examples as tests. For more, see [the chapter
-on documentation tests](documentation-tests.md).
+on documentation tests](write-documentation/documentation-tests.md).
 
-See also `--test-args`.
+See also `--test-args` and `--test-run-directory`.
 
 ## `--test-args`: pass options to test runner
 
@@ -190,7 +204,20 @@ $ rustdoc src/lib.rs --test --test-args ignored
 ```
 
 This flag will pass options to the test runner when running documentation tests.
-For more, see [the chapter on documentation tests](documentation-tests.md).
+For more, see [the chapter on documentation tests](write-documentation/documentation-tests.md).
+
+See also `--test`.
+
+## `--test-run-directory`: run code examples in a specific directory
+
+Using this flag looks like this:
+
+```bash
+$ rustdoc src/lib.rs --test --test-run-directory=/path/to/working/directory
+```
+
+This flag will run your code examples in the specified working directory.
+For more, see [the chapter on documentation tests](write-documentation/documentation-tests.md).
 
 See also `--test`.
 
@@ -246,7 +273,7 @@ will be added.
 
 When rendering Rust files, this flag is ignored.
 
-## `--html-in-header`: include more HTML in <head>
+## `--html-in-header`: include more HTML in `<head>`
 
 Using this flag looks like this:
 
@@ -320,10 +347,7 @@ $ rustdoc src/lib.rs --extend-css extra.css
 ```
 
 With this flag, the contents of the files you pass are included at the bottom
-of Rustdoc's `theme.css` file.
-
-While this flag is stable, the contents of `theme.css` are not, so be careful!
-Updates may break your theme extensions.
+of the `theme.css` file.
 
 ## `--sysroot`: override the system root
 
@@ -336,7 +360,7 @@ $ rustdoc src/lib.rs --sysroot /path/to/sysroot
 Similar to `rustc --sysroot`, this lets you change the sysroot `rustdoc` uses
 when compiling your code.
 
-### `--edition`: control the edition of docs and doctests
+## `--edition`: control the edition of docs and doctests
 
 Using this flag looks like this:
 
@@ -381,7 +405,7 @@ the same CSS rules as the official `light` theme.
 `--check-theme` flag, it discards all other flags and only performs the CSS rule
 comparison operation.
 
-### `--crate-version`: control the crate version
+## `--crate-version`: control the crate version
 
 Using this flag looks like this:
 
@@ -393,6 +417,12 @@ When `rustdoc` receives this flag, it will print an extra "Version (version)" in
 the crate root's docs. You can use this flag to differentiate between different versions of your
 library's documentation.
 
+## `-`: load source code from the standard input
+
+If you specify `-` as the INPUT on the command line, then `rustdoc` will read the
+source code from stdin (standard input stream) until the EOF, instead of the file
+system with an otherwise specified path.
+
 ## `@path`: load command-line flags from a path
 
 If you specify `@path` on the command-line, then it will open `path` and read
@@ -403,12 +433,12 @@ encoded as UTF-8.
 ## `--passes`: add more rustdoc passes
 
 This flag is **deprecated**.
-For more details on passes, see [the chapter on them](passes.md).
+For more details on passes, see [the chapter on them](deprecated-features.md#passes).
 
 ## `--no-defaults`: don't run default passes
 
 This flag is **deprecated**.
-For more details on passes, see [the chapter on them](passes.md).
+For more details on passes, see [the chapter on them](deprecated-features.md#passes).
 
 ## `-r`/`--input-format`: input format
 
@@ -417,10 +447,3 @@ This flag is **deprecated** and **has no effect**.
 Rustdoc only supports Rust source code and Markdown input formats. If the
 file ends in `.md` or `.markdown`, `rustdoc` treats it as a Markdown file.
 Otherwise, it assumes that the input file is Rust.
-
-## `--nocapture`
-
-When this flag is used with `--test`, the output (stdout and stderr) of your tests won't be
-captured by rustdoc. Instead, the output will be directed to your terminal,
-as if you had run the test executable manually. This is especially useful
-for debugging your tests!

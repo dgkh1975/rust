@@ -14,7 +14,7 @@ pub mod vec_deque;
 #[cfg(not(no_global_oom_handling))]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub mod btree_map {
-    //! A map based on a B-Tree.
+    //! An ordered map based on a B-Tree.
     #[stable(feature = "rust1", since = "1.0.0")]
     pub use super::btree::map::*;
 }
@@ -22,38 +22,35 @@ pub mod btree_map {
 #[cfg(not(no_global_oom_handling))]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub mod btree_set {
-    //! A set based on a B-Tree.
+    //! An ordered set based on a B-Tree.
     #[stable(feature = "rust1", since = "1.0.0")]
     pub use super::btree::set::*;
 }
+
+use core::fmt::Display;
 
 #[cfg(not(no_global_oom_handling))]
 #[stable(feature = "rust1", since = "1.0.0")]
 #[doc(no_inline)]
 pub use binary_heap::BinaryHeap;
-
 #[cfg(not(no_global_oom_handling))]
 #[stable(feature = "rust1", since = "1.0.0")]
 #[doc(no_inline)]
 pub use btree_map::BTreeMap;
-
 #[cfg(not(no_global_oom_handling))]
 #[stable(feature = "rust1", since = "1.0.0")]
 #[doc(no_inline)]
 pub use btree_set::BTreeSet;
-
 #[cfg(not(no_global_oom_handling))]
 #[stable(feature = "rust1", since = "1.0.0")]
 #[doc(no_inline)]
 pub use linked_list::LinkedList;
-
 #[cfg(not(no_global_oom_handling))]
 #[stable(feature = "rust1", since = "1.0.0")]
 #[doc(no_inline)]
 pub use vec_deque::VecDeque;
 
 use crate::alloc::{Layout, LayoutError};
-use core::fmt::Display;
 
 /// The error type for `try_reserve` methods.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -65,6 +62,7 @@ pub struct TryReserveError {
 impl TryReserveError {
     /// Details about the allocation that caused the error
     #[inline]
+    #[must_use]
     #[unstable(
         feature = "try_reserve_kind",
         reason = "Uncertain how much info should be exposed",
@@ -138,7 +136,7 @@ impl Display for TryReserveError {
                 " because the computed capacity exceeded the collection's maximum"
             }
             TryReserveErrorKind::AllocError { .. } => {
-                " because the memory allocator returned a error"
+                " because the memory allocator returned an error"
             }
         };
         fmt.write_str(reason)
@@ -147,7 +145,11 @@ impl Display for TryReserveError {
 
 /// An intermediate trait for specialization of `Extend`.
 #[doc(hidden)]
+#[cfg(not(no_global_oom_handling))]
 trait SpecExtend<I: IntoIterator> {
     /// Extends `self` with the contents of the given iterator.
     fn spec_extend(&mut self, iter: I);
 }
+
+#[stable(feature = "try_reserve", since = "1.57.0")]
+impl core::error::Error for TryReserveError {}

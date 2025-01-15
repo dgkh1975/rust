@@ -1,5 +1,4 @@
-// run-rustfix
-// aux-build:option_helpers.rs
+//@aux-build:option_helpers.rs
 
 #![warn(clippy::iter_count)]
 #![allow(
@@ -7,7 +6,8 @@
     array_into_iter,
     unused_mut,
     clippy::into_iter_on_ref,
-    clippy::unnecessary_operation
+    clippy::unnecessary_operation,
+    clippy::useless_vec
 )]
 
 extern crate option_helpers;
@@ -33,6 +33,7 @@ impl HasIter {
     }
 }
 
+#[allow(unused_must_use)]
 fn main() {
     let mut vec = vec![0, 1, 2, 3];
     let mut boxed_slice: Box<[u8]> = Box::new([0, 1, 2, 3]);
@@ -50,7 +51,7 @@ fn main() {
     linked_list.push_back(1);
     binary_heap.push(1);
 
-    let _ = &vec[..].iter().count();
+    &vec[..].iter().count();
     vec.iter().count();
     boxed_slice.iter().count();
     vec_deque.iter().count();
@@ -62,13 +63,13 @@ fn main() {
     binary_heap.iter().count();
 
     vec.iter_mut().count();
-    let _ = &vec[..].iter_mut().count();
+    &vec[..].iter_mut().count();
     vec_deque.iter_mut().count();
     hash_map.iter_mut().count();
     b_tree_map.iter_mut().count();
     linked_list.iter_mut().count();
 
-    let _ = &vec[..].into_iter().count();
+    &vec[..].into_iter().count();
     vec.into_iter().count();
     vec_deque.into_iter().count();
     hash_set.into_iter().count();

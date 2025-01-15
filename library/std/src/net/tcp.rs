@@ -1,15 +1,21 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
-#[cfg(all(test, not(target_os = "emscripten")))]
+#[cfg(all(
+    test,
+    not(any(
+        target_os = "emscripten",
+        all(target_os = "wasi", target_env = "p1"),
+        target_os = "xous"
+    ))
+))]
 mod tests;
 
-use crate::io::prelude::*;
-
 use crate::fmt;
-use crate::io::{self, Initializer, IoSlice, IoSliceMut};
+use crate::io::prelude::*;
+use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
+use crate::iter::FusedIterator;
 use crate::net::{Shutdown, SocketAddr, ToSocketAddrs};
-use crate::sys_common::net as net_imp;
-use crate::sys_common::{AsInner, FromInner, IntoInner};
+use crate::sys_common::{AsInner, FromInner, IntoInner, net as net_imp};
 use crate::time::Duration;
 
 /// A TCP stream between a local and a remote socket.
@@ -90,6 +96,7 @@ pub struct TcpListener(net_imp::TcpListener);
 /// See its documentation for more.
 ///
 /// [`accept`]: TcpListener::accept
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 #[stable(feature = "rust1", since = "1.0.0")]
 #[derive(Debug)]
 pub struct Incoming<'a> {
@@ -103,7 +110,7 @@ pub struct Incoming<'a> {
 ///
 /// [`accept`]: TcpListener::accept
 #[derive(Debug)]
-#[unstable(feature = "tcplistener_into_incoming", issue = "88339")]
+#[unstable(feature = "tcplistener_into_incoming", issue = "88373")]
 pub struct IntoIncoming {
     listener: TcpListener,
 }
@@ -404,7 +411,7 @@ impl TcpStream {
     /// use std::net::TcpStream;
     ///
     /// let stream = TcpStream::connect("127.0.0.1:8000")
-    ///                        .expect("couldn't bind to address");
+    ///                        .expect("Couldn't connect to the server...");
     /// let mut buf = [0; 10];
     /// let len = stream.peek(&mut buf).expect("peek failed");
     /// ```
@@ -561,7 +568,7 @@ impl TcpStream {
 
     /// Moves this TCP stream into or out of nonblocking mode.
     ///
-    /// This will result in `read`, `write`, `recv` and `send` operations
+    /// This will result in `read`, `write`, `recv` and `send` system operations
     /// becoming nonblocking, i.e., immediately returning from their calls.
     /// If the IO operation is successful, `Ok` is returned and no further
     /// action is required. If the IO operation could not be completed and needs
@@ -594,10 +601,10 @@ impl TcpStream {
     ///             // via platform-specific APIs such as epoll or IOCP
     ///             wait_for_fd();
     ///         }
-    ///         Err(e) => panic!("encountered IO error: {}", e),
+    ///         Err(e) => panic!("encountered IO error: {e}"),
     ///     };
     /// };
-    /// println!("bytes: {:?}", buf);
+    /// println!("bytes: {buf:?}");
     /// ```
     #[stable(feature = "net2_mutators", since = "1.9.0")]
     pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
@@ -617,6 +624,10 @@ impl Read for TcpStream {
         self.0.read(buf)
     }
 
+    fn read_buf(&mut self, buf: BorrowedCursor<'_>) -> io::Result<()> {
+        self.0.read_buf(buf)
+    }
+
     fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
         self.0.read_vectored(bufs)
     }
@@ -624,12 +635,6 @@ impl Read for TcpStream {
     #[inline]
     fn is_read_vectored(&self) -> bool {
         self.0.is_read_vectored()
-    }
-
-    #[inline]
-    unsafe fn initializer(&self) -> Initializer {
-        // SAFETY: Read is guaranteed to work on uninitialized memory
-        unsafe { Initializer::nop() }
     }
 }
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -647,6 +652,7 @@ impl Write for TcpStream {
         self.0.is_write_vectored()
     }
 
+    #[inline]
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
@@ -657,6 +663,10 @@ impl Read for &TcpStream {
         self.0.read(buf)
     }
 
+    fn read_buf(&mut self, buf: BorrowedCursor<'_>) -> io::Result<()> {
+        self.0.read_buf(buf)
+    }
+
     fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
         self.0.read_vectored(bufs)
     }
@@ -664,12 +674,6 @@ impl Read for &TcpStream {
     #[inline]
     fn is_read_vectored(&self) -> bool {
         self.0.is_read_vectored()
-    }
-
-    #[inline]
-    unsafe fn initializer(&self) -> Initializer {
-        // SAFETY: Read is guaranteed to work on uninitialized memory
-        unsafe { Initializer::nop() }
     }
 }
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -687,12 +691,14 @@ impl Write for &TcpStream {
         self.0.is_write_vectored()
     }
 
+    #[inline]
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
 }
 
 impl AsInner<net_imp::TcpStream> for TcpStream {
+    #[inline]
     fn as_inner(&self) -> &net_imp::TcpStream {
         &self.0
     }
@@ -757,6 +763,15 @@ impl TcpListener {
     /// ];
     /// let listener = TcpListener::bind(&addrs[..]).unwrap();
     /// ```
+    ///
+    /// Creates a TCP listener bound to a port assigned by the operating system
+    /// at `127.0.0.1`.
+    ///
+    /// ```no_run
+    /// use std::net::TcpListener;
+    ///
+    /// let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+    /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<TcpListener> {
         super::each_addr(addr, net_imp::TcpListener::bind).map(TcpListener)
@@ -810,8 +825,8 @@ impl TcpListener {
     ///
     /// let listener = TcpListener::bind("127.0.0.1:8080").unwrap();
     /// match listener.accept() {
-    ///     Ok((_socket, addr)) => println!("new client: {:?}", addr),
-    ///     Err(e) => println!("couldn't get client: {:?}", e),
+    ///     Ok((_socket, addr)) => println!("new client: {addr:?}"),
+    ///     Err(e) => println!("couldn't get client: {e:?}"),
     /// }
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
@@ -839,7 +854,7 @@ impl TcpListener {
     /// }
     ///
     /// fn main() -> std::io::Result<()> {
-    ///     let listener = TcpListener::bind("127.0.0.1:80").unwrap();
+    ///     let listener = TcpListener::bind("127.0.0.1:80")?;
     ///
     ///     for stream in listener.incoming() {
     ///         match stream {
@@ -871,7 +886,7 @@ impl TcpListener {
     /// use std::net::{TcpListener, TcpStream};
     ///
     /// fn listen_on(port: u16) -> impl Iterator<Item = TcpStream> {
-    ///     let listener = TcpListener::bind("127.0.0.1:80").unwrap();
+    ///     let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
     ///     listener.into_incoming()
     ///         .filter_map(Result::ok) /* Ignore failed connections */
     /// }
@@ -884,7 +899,7 @@ impl TcpListener {
     /// }
     /// ```
     #[must_use = "`self` will be dropped if the result is not used"]
-    #[unstable(feature = "tcplistener_into_incoming", issue = "88339")]
+    #[unstable(feature = "tcplistener_into_incoming", issue = "88373")]
     pub fn into_incoming(self) -> IntoIncoming {
         IntoIncoming { listener: self }
     }
@@ -926,20 +941,14 @@ impl TcpListener {
     }
 
     #[stable(feature = "net2_mutators", since = "1.9.0")]
-    #[rustc_deprecated(
-        since = "1.16.0",
-        reason = "this option can only be set before the socket is bound"
-    )]
+    #[deprecated(since = "1.16.0", note = "this option can only be set before the socket is bound")]
     #[allow(missing_docs)]
     pub fn set_only_v6(&self, only_v6: bool) -> io::Result<()> {
         self.0.set_only_v6(only_v6)
     }
 
     #[stable(feature = "net2_mutators", since = "1.9.0")]
-    #[rustc_deprecated(
-        since = "1.16.0",
-        reason = "this option can only be set before the socket is bound"
-    )]
+    #[deprecated(since = "1.16.0", note = "this option can only be set before the socket is bound")]
     #[allow(missing_docs)]
     pub fn only_v6(&self) -> io::Result<bool> {
         self.0.only_v6()
@@ -1002,7 +1011,7 @@ impl TcpListener {
     ///             wait_for_fd();
     ///             continue;
     ///         }
-    ///         Err(e) => panic!("encountered IO error: {}", e),
+    ///         Err(e) => panic!("encountered IO error: {e}"),
     ///     }
     /// }
     /// ```
@@ -1026,7 +1035,10 @@ impl<'a> Iterator for Incoming<'a> {
     }
 }
 
-#[unstable(feature = "tcplistener_into_incoming", issue = "88339")]
+#[stable(feature = "tcp_listener_incoming_fused_iterator", since = "1.64.0")]
+impl FusedIterator for Incoming<'_> {}
+
+#[unstable(feature = "tcplistener_into_incoming", issue = "88373")]
 impl Iterator for IntoIncoming {
     type Item = io::Result<TcpStream>;
     fn next(&mut self) -> Option<io::Result<TcpStream>> {
@@ -1034,7 +1046,11 @@ impl Iterator for IntoIncoming {
     }
 }
 
+#[unstable(feature = "tcplistener_into_incoming", issue = "88373")]
+impl FusedIterator for IntoIncoming {}
+
 impl AsInner<net_imp::TcpListener> for TcpListener {
+    #[inline]
     fn as_inner(&self) -> &net_imp::TcpListener {
         &self.0
     }

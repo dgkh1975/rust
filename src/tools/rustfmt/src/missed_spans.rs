@@ -1,9 +1,10 @@
 use rustc_span::{BytePos, Pos, Span};
+use tracing::debug;
 
-use crate::comment::{is_last_comment_block, rewrite_comment, CodeCharKind, CommentCodeSlices};
-use crate::config::file_lines::FileLines;
+use crate::comment::{CodeCharKind, CommentCodeSlices, is_last_comment_block, rewrite_comment};
 use crate::config::FileName;
-use crate::config::Version;
+use crate::config::StyleEdition;
+use crate::config::file_lines::FileLines;
 use crate::coverage::transform_missing_snippet;
 use crate::shape::{Indent, Shape};
 use crate::source_map::LineRangeUtils;
@@ -51,6 +52,14 @@ impl<'a> FmtVisitor<'a> {
     }
 
     pub(crate) fn format_missing_with_indent(&mut self, end: BytePos) {
+        self.format_missing_indent(end, true)
+    }
+
+    pub(crate) fn format_missing_no_indent(&mut self, end: BytePos) {
+        self.format_missing_indent(end, false)
+    }
+
+    fn format_missing_indent(&mut self, end: BytePos, should_indent: bool) {
         let config = self.config;
         self.format_missing_inner(end, |this, last_snippet, snippet| {
             this.push_str(last_snippet.trim_end());
@@ -58,14 +67,10 @@ impl<'a> FmtVisitor<'a> {
                 // No new lines in the snippet.
                 this.push_str("\n");
             }
-            let indent = this.block_indent.to_string(config);
-            this.push_str(&indent);
-        })
-    }
-
-    pub(crate) fn format_missing_no_indent(&mut self, end: BytePos) {
-        self.format_missing_inner(end, |this, last_snippet, _| {
-            this.push_str(last_snippet.trim_end());
+            if should_indent {
+                let indent = this.block_indent.to_string(config);
+                this.push_str(&indent);
+            }
         })
     }
 
@@ -87,7 +92,7 @@ impl<'a> FmtVisitor<'a> {
         assert!(
             start < end,
             "Request to format inverted span: {}",
-            self.parse_sess.span_to_debug_info(mk_sp(start, end)),
+            self.psess.span_to_debug_info(mk_sp(start, end)),
         );
 
         self.last_pos = end;
@@ -162,8 +167,8 @@ impl<'a> FmtVisitor<'a> {
         // Trim whitespace from the right hand side of each line.
         // Annoyingly, the library functions for splitting by lines etc. are not
         // quite right, so we must do it ourselves.
-        let line = self.parse_sess.line_of_byte_pos(span.lo());
-        let file_name = &self.parse_sess.span_to_filename(span);
+        let line = self.psess.line_of_byte_pos(span.lo());
+        let file_name = &self.psess.span_to_filename(span);
         let mut status = SnippetStatus::new(line);
 
         let snippet = &*transform_missing_snippet(self.config, old_snippet);
@@ -242,7 +247,9 @@ impl<'a> FmtVisitor<'a> {
             let indent_str = self.block_indent.to_string(self.config);
             self.push_str(&indent_str);
             self.block_indent
-        } else if self.config.version() == Version::Two && !snippet.starts_with('\n') {
+        } else if self.config.style_edition() >= StyleEdition::Edition2024
+            && !snippet.starts_with('\n')
+        {
             // The comment appears on the same line as the previous formatted code.
             // Assuming that comment is logically associated with that code, we want to keep it on
             // the same level and avoid mixing it with possible other comment.
@@ -278,13 +285,13 @@ impl<'a> FmtVisitor<'a> {
                     let other_lines = &subslice[offset + 1..];
                     let comment_str =
                         rewrite_comment(other_lines, false, comment_shape, self.config)
-                            .unwrap_or_else(|| String::from(other_lines));
+                            .unwrap_or_else(|_| String::from(other_lines));
                     self.push_str(&comment_str);
                 }
             }
         } else {
             let comment_str = rewrite_comment(subslice, false, comment_shape, self.config)
-                .unwrap_or_else(|| String::from(subslice));
+                .unwrap_or_else(|_| String::from(subslice));
             self.push_str(&comment_str);
         }
 

@@ -1,4 +1,4 @@
-//! Shared utilties used by both float and integer formatting.
+//! Shared utilities used by both float and integer formatting.
 #![doc(hidden)]
 #![unstable(
     feature = "numfmt",
@@ -31,10 +31,8 @@ impl<'a> Part<'a> {
                     } else {
                         3
                     }
-                } else if v < 10_000 {
-                    4
                 } else {
-                    5
+                    if v < 10_000 { 4 } else { 5 }
                 }
             }
             Part::Copy(buf) => buf.len(),

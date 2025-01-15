@@ -1,218 +1,230 @@
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
-use rustc_data_structures::sync::{self, Lrc};
-use rustc_driver::abort_on_err;
-use rustc_errors::emitter::{Emitter, EmitterWriter};
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, LazyLock};
+use std::{io, mem};
+
+use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexMap};
+use rustc_data_structures::sync::Lrc;
+use rustc_data_structures::unord::UnordSet;
+use rustc_errors::TerminalUrl;
+use rustc_errors::codes::*;
+use rustc_errors::emitter::{
+    DynEmitter, HumanEmitter, HumanReadableErrorType, OutputTheme, stderr_destination,
+};
 use rustc_errors::json::JsonEmitter;
 use rustc_feature::UnstableFeatures;
 use rustc_hir::def::Res;
-use rustc_hir::def_id::{DefId, LocalDefId};
-use rustc_hir::HirId;
-use rustc_hir::{
-    intravisit::{self, NestedVisitorMap, Visitor},
-    Path,
-};
-use rustc_interface::{interface, Queries};
-use rustc_middle::hir::map::Map;
-use rustc_middle::middle::privacy::AccessLevels;
-use rustc_middle::ty::{ParamEnv, Ty, TyCtxt};
-use rustc_resolve as resolve;
-use rustc_session::config::{self, CrateType, ErrorOutputType};
-use rustc_session::lint;
-use rustc_session::DiagnosticOutput;
-use rustc_session::Session;
+use rustc_hir::def_id::{DefId, DefIdMap, DefIdSet, LocalDefId};
+use rustc_hir::intravisit::{self, Visitor};
+use rustc_hir::{HirId, Path};
+use rustc_interface::interface;
+use rustc_lint::{MissingDoc, late_lint_mod};
+use rustc_middle::hir::nested_filter;
+use rustc_middle::ty::{self, ParamEnv, Ty, TyCtxt};
+use rustc_session::config::{self, CrateType, ErrorOutputType, Input, ResolveDocLinks};
+pub(crate) use rustc_session::config::{Options, UnstableOptions};
+use rustc_session::{Session, lint};
 use rustc_span::source_map;
 use rustc_span::symbol::sym;
-use rustc_span::Span;
-
-use std::cell::RefCell;
-use std::lazy::SyncLazy;
-use std::mem;
-use std::rc::Rc;
+use tracing::{debug, info};
 
 use crate::clean::inline::build_external_trait;
-use crate::clean::{self, ItemId, TraitWithExtraInfo};
+use crate::clean::{self, ItemId};
 use crate::config::{Options as RustdocOptions, OutputFormat, RenderOptions};
 use crate::formats::cache::Cache;
-use crate::passes::{self, Condition::*, ConditionalPass};
+use crate::passes;
+use crate::passes::Condition::*;
+use crate::passes::collect_intra_doc_links::LinkCollector;
 
-crate use rustc_session::config::{DebuggingOptions, Input, Options};
-
-crate struct DocContext<'tcx> {
-    crate tcx: TyCtxt<'tcx>,
-    /// Name resolver. Used for intra-doc links.
-    ///
-    /// The `Rc<RefCell<...>>` wrapping is needed because that is what's returned by
-    /// [`Queries::expansion()`].
-    // FIXME: see if we can get rid of this RefCell somehow
-    crate resolver: Rc<RefCell<interface::BoxedResolver>>,
+pub(crate) struct DocContext<'tcx> {
+    pub(crate) tcx: TyCtxt<'tcx>,
     /// Used for normalization.
     ///
     /// Most of this logic is copied from rustc_lint::late.
-    crate param_env: ParamEnv<'tcx>,
+    pub(crate) param_env: ParamEnv<'tcx>,
     /// Later on moved through `clean::Crate` into `cache`
-    crate external_traits: Rc<RefCell<FxHashMap<DefId, clean::TraitWithExtraInfo>>>,
+    pub(crate) external_traits: FxIndexMap<DefId, clean::Trait>,
     /// Used while populating `external_traits` to ensure we don't process the same trait twice at
     /// the same time.
-    crate active_extern_traits: FxHashSet<DefId>,
-    // The current set of type and lifetime substitutions,
-    // for expanding type aliases at the HIR level:
-    /// Table `DefId` of type parameter -> substituted type
-    crate ty_substs: FxHashMap<DefId, clean::Type>,
-    /// Table `DefId` of lifetime parameter -> substituted lifetime
-    crate lt_substs: FxHashMap<DefId, clean::Lifetime>,
-    /// Table `DefId` of const parameter -> substituted const
-    crate ct_substs: FxHashMap<DefId, clean::Constant>,
+    pub(crate) active_extern_traits: DefIdSet,
+    /// The current set of parameter instantiations for expanding type aliases at the HIR level.
+    ///
+    /// Maps from the `DefId` of a lifetime or type parameter to the
+    /// generic argument it's currently instantiated to in this context.
+    // FIXME(#82852): We don't record const params since we don't visit const exprs at all and
+    // therefore wouldn't use the corresp. generic arg anyway. Add support for them.
+    pub(crate) args: DefIdMap<clean::GenericArg>,
+    pub(crate) current_type_aliases: DefIdMap<usize>,
     /// Table synthetic type parameter for `impl Trait` in argument position -> bounds
-    crate impl_trait_bounds: FxHashMap<ImplTraitParam, Vec<clean::GenericBound>>,
+    pub(crate) impl_trait_bounds: FxHashMap<ImplTraitParam, Vec<clean::GenericBound>>,
     /// Auto-trait or blanket impls processed so far, as `(self_ty, trait_def_id)`.
     // FIXME(eddyb) make this a `ty::TraitRef<'tcx>` set.
-    crate generated_synthetics: FxHashSet<(Ty<'tcx>, DefId)>,
-    crate auto_traits: Vec<DefId>,
+    pub(crate) generated_synthetics: FxHashSet<(Ty<'tcx>, DefId)>,
+    pub(crate) auto_traits: Vec<DefId>,
     /// The options given to rustdoc that could be relevant to a pass.
-    crate render_options: RenderOptions,
-    /// The traits in scope for a given module.
-    ///
-    /// See `collect_intra_doc_links::traits_implemented_by` for more details.
-    /// `map<module, set<trait>>`
-    crate module_trait_cache: FxHashMap<DefId, FxHashSet<DefId>>,
+    pub(crate) render_options: RenderOptions,
     /// This same cache is used throughout rustdoc, including in [`crate::html::render`].
-    crate cache: Cache,
+    pub(crate) cache: Cache,
     /// Used by [`clean::inline`] to tell if an item has already been inlined.
-    crate inlined: FxHashSet<ItemId>,
+    pub(crate) inlined: FxHashSet<ItemId>,
     /// Used by `calculate_doc_coverage`.
-    crate output_format: OutputFormat,
+    pub(crate) output_format: OutputFormat,
+    /// Used by `strip_private`.
+    pub(crate) show_coverage: bool,
 }
 
 impl<'tcx> DocContext<'tcx> {
-    crate fn sess(&self) -> &'tcx Session {
-        &self.tcx.sess
+    pub(crate) fn sess(&self) -> &'tcx Session {
+        self.tcx.sess
     }
 
-    crate fn with_param_env<T, F: FnOnce(&mut Self) -> T>(&mut self, def_id: DefId, f: F) -> T {
+    pub(crate) fn with_param_env<T, F: FnOnce(&mut Self) -> T>(
+        &mut self,
+        def_id: DefId,
+        f: F,
+    ) -> T {
         let old_param_env = mem::replace(&mut self.param_env, self.tcx.param_env(def_id));
         let ret = f(self);
         self.param_env = old_param_env;
         ret
     }
 
-    crate fn enter_resolver<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(&mut resolve::Resolver<'_>) -> R,
-    {
-        self.resolver.borrow_mut().access(f)
+    pub(crate) fn typing_env(&self) -> ty::TypingEnv<'tcx> {
+        ty::TypingEnv {
+            typing_mode: ty::TypingMode::non_body_analysis(),
+            param_env: self.param_env,
+        }
     }
 
     /// Call the closure with the given parameters set as
-    /// the substitutions for a type alias' RHS.
-    crate fn enter_alias<F, R>(
+    /// the generic parameters for a type alias' RHS.
+    pub(crate) fn enter_alias<F, R>(
         &mut self,
-        ty_substs: FxHashMap<DefId, clean::Type>,
-        lt_substs: FxHashMap<DefId, clean::Lifetime>,
-        ct_substs: FxHashMap<DefId, clean::Constant>,
+        args: DefIdMap<clean::GenericArg>,
+        def_id: DefId,
         f: F,
     ) -> R
     where
         F: FnOnce(&mut Self) -> R,
     {
-        let (old_tys, old_lts, old_cts) = (
-            mem::replace(&mut self.ty_substs, ty_substs),
-            mem::replace(&mut self.lt_substs, lt_substs),
-            mem::replace(&mut self.ct_substs, ct_substs),
-        );
+        let old_args = mem::replace(&mut self.args, args);
+        *self.current_type_aliases.entry(def_id).or_insert(0) += 1;
         let r = f(self);
-        self.ty_substs = old_tys;
-        self.lt_substs = old_lts;
-        self.ct_substs = old_cts;
+        self.args = old_args;
+        if let Some(count) = self.current_type_aliases.get_mut(&def_id) {
+            *count -= 1;
+            if *count == 0 {
+                self.current_type_aliases.remove(&def_id);
+            }
+        }
         r
     }
 
-    /// Like `hir().local_def_id_to_hir_id()`, but skips calling it on fake DefIds.
+    /// Like `tcx.local_def_id_to_hir_id()`, but skips calling it on fake DefIds.
     /// (This avoids a slice-index-out-of-bounds panic.)
-    crate fn as_local_hir_id(tcx: TyCtxt<'_>, def_id: ItemId) -> Option<HirId> {
-        match def_id {
+    pub(crate) fn as_local_hir_id(tcx: TyCtxt<'_>, item_id: ItemId) -> Option<HirId> {
+        match item_id {
             ItemId::DefId(real_id) => {
-                real_id.as_local().map(|def_id| tcx.hir().local_def_id_to_hir_id(def_id))
+                real_id.as_local().map(|def_id| tcx.local_def_id_to_hir_id(def_id))
             }
             // FIXME: Can this be `Some` for `Auto` or `Blanket`?
             _ => None,
         }
     }
+
+    /// Returns `true` if the JSON output format is enabled for generating the crate content.
+    ///
+    /// If another option like `--show-coverage` is enabled, it will return `false`.
+    pub(crate) fn is_json_output(&self) -> bool {
+        self.output_format.is_json() && !self.show_coverage
+    }
 }
 
-/// Creates a new diagnostic `Handler` that can be used to emit warnings and errors.
+/// Creates a new `DiagCtxt` that can be used to emit warnings and errors.
 ///
 /// If the given `error_format` is `ErrorOutputType::Json` and no `SourceMap` is given, a new one
-/// will be created for the handler.
-crate fn new_handler(
+/// will be created for the `DiagCtxt`.
+pub(crate) fn new_dcx(
     error_format: ErrorOutputType,
     source_map: Option<Lrc<source_map::SourceMap>>,
-    debugging_opts: &DebuggingOptions,
-) -> rustc_errors::Handler {
-    let emitter: Box<dyn Emitter + sync::Send> = match error_format {
-        ErrorOutputType::HumanReadable(kind) => {
-            let (short, color_config) = kind.unzip();
+    diagnostic_width: Option<usize>,
+    unstable_opts: &UnstableOptions,
+) -> rustc_errors::DiagCtxt {
+    let fallback_bundle = rustc_errors::fallback_fluent_bundle(
+        rustc_driver::DEFAULT_LOCALE_RESOURCES.to_vec(),
+        false,
+    );
+    let emitter: Box<DynEmitter> = match error_format {
+        ErrorOutputType::HumanReadable(kind, color_config) => {
+            let short = kind.short();
             Box::new(
-                EmitterWriter::stderr(
-                    color_config,
-                    source_map.map(|sm| sm as _),
-                    short,
-                    debugging_opts.teach,
-                    debugging_opts.terminal_width,
-                    false,
-                )
-                .ui_testing(debugging_opts.ui_testing),
+                HumanEmitter::new(stderr_destination(color_config), fallback_bundle)
+                    .sm(source_map.map(|sm| sm as _))
+                    .short_message(short)
+                    .teach(unstable_opts.teach)
+                    .diagnostic_width(diagnostic_width)
+                    .track_diagnostics(unstable_opts.track_diagnostics)
+                    .theme(if let HumanReadableErrorType::Unicode = kind {
+                        OutputTheme::Unicode
+                    } else {
+                        OutputTheme::Ascii
+                    })
+                    .ui_testing(unstable_opts.ui_testing),
             )
         }
-        ErrorOutputType::Json { pretty, json_rendered } => {
+        ErrorOutputType::Json { pretty, json_rendered, color_config } => {
             let source_map = source_map.unwrap_or_else(|| {
                 Lrc::new(source_map::SourceMap::new(source_map::FilePathMapping::empty()))
             });
             Box::new(
-                JsonEmitter::stderr(
-                    None,
+                JsonEmitter::new(
+                    Box::new(io::BufWriter::new(io::stderr())),
                     source_map,
+                    fallback_bundle,
                     pretty,
                     json_rendered,
-                    debugging_opts.terminal_width,
-                    false,
+                    color_config,
                 )
-                .ui_testing(debugging_opts.ui_testing),
+                .ui_testing(unstable_opts.ui_testing)
+                .diagnostic_width(diagnostic_width)
+                .track_diagnostics(unstable_opts.track_diagnostics)
+                .terminal_url(TerminalUrl::No),
             )
         }
     };
 
-    rustc_errors::Handler::with_emitter_and_flags(
-        emitter,
-        debugging_opts.diagnostic_handler_flags(true),
-    )
+    rustc_errors::DiagCtxt::new(emitter).with_flags(unstable_opts.dcx_flags(true))
 }
 
 /// Parse, resolve, and typecheck the given crate.
-crate fn create_config(
+pub(crate) fn create_config(
+    input: Input,
     RustdocOptions {
-        input,
         crate_name,
         proc_macro_crate,
         error_format,
+        diagnostic_width,
         libs,
         externs,
         mut cfgs,
+        check_cfgs,
         codegen_options,
-        debugging_opts,
+        unstable_opts,
         target,
         edition,
         maybe_sysroot,
         lint_opts,
         describe_lints,
         lint_cap,
+        scrape_examples_options,
+        expanded_args,
+        remap_path_prefix,
         ..
     }: RustdocOptions,
+    RenderOptions { document_private, .. }: &RenderOptions,
+    using_internal_features: Arc<AtomicBool>,
 ) -> rustc_interface::Config {
     // Add the doc cfg into the doc build.
     cfgs.push("doc".to_string());
-
-    let cpath = Some(input.clone());
-    let input = Input::File(input);
 
     // By default, rustdoc ignores all lints.
     // Specifically unblock lints relevant to documentation or the lint machinery itself.
@@ -223,6 +235,9 @@ crate fn create_config(
         // these are definitely not part of rustdoc, but we want to warn on them anyway.
         rustc_lint::builtin::RENAMED_AND_REMOVED_LINTS.name.to_string(),
         rustc_lint::builtin::UNKNOWN_LINTS.name.to_string(),
+        rustc_lint::builtin::UNEXPECTED_CFGS.name.to_string(),
+        // this lint is needed to support `#[expect]` attributes
+        rustc_lint::builtin::UNFULFILLED_LINT_EXPECTATIONS.name.to_string(),
     ];
     lints_to_show.extend(crate::lint::RUSTDOC_LINTS.iter().map(|lint| lint.name.to_string()));
 
@@ -232,6 +247,9 @@ crate fn create_config(
 
     let crate_types =
         if proc_macro_crate { vec![CrateType::ProcMacro] } else { vec![CrateType::Rlib] };
+    let resolve_doc_links =
+        if *document_private { ResolveDocLinks::All } else { ResolveDocLinks::Exported };
+    let test = scrape_examples_options.map(|opts| opts.scrape_tests).unwrap_or(false);
     // plays with error output here!
     let sessopts = config::Options {
         maybe_sysroot,
@@ -244,36 +262,38 @@ crate fn create_config(
         target_triple: target,
         unstable_features: UnstableFeatures::from_environment(crate_name.as_deref()),
         actually_rustdoc: true,
-        debugging_opts,
+        resolve_doc_links,
+        unstable_opts,
         error_format,
+        diagnostic_width,
         edition,
         describe_lints,
         crate_name,
+        test,
+        remap_path_prefix,
         ..Options::default()
     };
 
     interface::Config {
         opts: sessopts,
-        crate_cfg: interface::parse_cfgspecs(cfgs),
+        crate_cfg: cfgs,
+        crate_check_cfg: check_cfgs,
         input,
-        input_path: cpath,
         output_file: None,
         output_dir: None,
         file_loader: None,
-        diagnostic_output: DiagnosticOutput::Default,
-        stderr: None,
+        locale_resources: rustc_driver::DEFAULT_LOCALE_RESOURCES.to_vec(),
         lint_caps,
-        parse_sess_created: None,
-        register_lints: Some(box crate::lint::register_lints),
-        override_queries: Some(|_sess, providers, _external_providers| {
+        psess_created: None,
+        hash_untracked_state: None,
+        register_lints: Some(Box::new(crate::lint::register_lints)),
+        override_queries: Some(|_sess, providers| {
+            // We do not register late module lints, so this only runs `MissingDoc`.
             // Most lints will require typechecking, so just don't run them.
-            providers.lint_mod = |_, _| {};
-            // Prevent `rustc_typeck::check_crate` from calling `typeck` on all bodies.
-            providers.typeck_item_bodies = |_, _| {};
+            providers.lint_mod = |tcx, module_def_id| late_lint_mod(tcx, module_def_id, MissingDoc);
             // hack so that `used_trait_imports` won't try to call typeck
             providers.used_trait_imports = |_, _| {
-                static EMPTY_SET: SyncLazy<FxHashSet<LocalDefId>> =
-                    SyncLazy::new(FxHashSet::default);
+                static EMPTY_SET: LazyLock<UnordSet<LocalDefId>> = LazyLock::new(UnordSet::default);
                 &EMPTY_SET
             };
             // In case typeck does end up being called, don't ICE in case there were name resolution errors
@@ -281,38 +301,29 @@ crate fn create_config(
                 // Closures' tables come from their outermost function,
                 // as they are part of the same "inference environment".
                 // This avoids emitting errors for the parent twice (see similar code in `typeck_with_fallback`)
-                let outer_def_id = tcx.closure_base_def_id(def_id.to_def_id()).expect_local();
-                if outer_def_id != def_id {
-                    return tcx.typeck(outer_def_id);
+                let typeck_root_def_id = tcx.typeck_root_def_id(def_id.to_def_id()).expect_local();
+                if typeck_root_def_id != def_id {
+                    return tcx.typeck(typeck_root_def_id);
                 }
 
                 let hir = tcx.hir();
-                let body = hir.body(hir.body_owned_by(hir.local_def_id_to_hir_id(def_id)));
-                debug!("visiting body for {:?}", def_id);
+                let body = hir.body_owned_by(def_id);
+                debug!("visiting body for {def_id:?}");
                 EmitIgnoredResolutionErrors::new(tcx).visit_body(body);
                 (rustc_interface::DEFAULT_QUERY_PROVIDERS.typeck)(tcx, def_id)
             };
         }),
         make_codegen_backend: None,
         registry: rustc_driver::diagnostics_registry(),
+        ice_file: None,
+        using_internal_features,
+        expanded_args,
     }
 }
 
-crate fn create_resolver<'a>(
-    queries: &Queries<'a>,
-    sess: &Session,
-) -> Rc<RefCell<interface::BoxedResolver>> {
-    let (krate, resolver, _) = &*abort_on_err(queries.expansion(), sess).peek();
-    let resolver = resolver.clone();
-
-    crate::passes::collect_intra_doc_links::load_intra_link_crates(resolver, krate)
-}
-
-crate fn run_global_ctxt(
+pub(crate) fn run_global_ctxt(
     tcx: TyCtxt<'_>,
-    resolver: Rc<RefCell<interface::BoxedResolver>>,
-    mut default_passes: passes::DefaultPassOption,
-    manual_passes: Vec<String>,
+    show_coverage: bool,
     render_options: RenderOptions,
     output_format: OutputFormat,
 ) -> (clean::Crate, RenderOptions, Cache) {
@@ -324,160 +335,87 @@ crate fn run_global_ctxt(
     // typeck function bodies or run the default rustc lints.
     // (see `override_queries` in the `config`)
 
-    // HACK(jynelson) this calls an _extremely_ limited subset of `typeck`
-    // and might break if queries change their assumptions in the future.
+    // NOTE: These are copy/pasted from typeck/lib.rs and should be kept in sync with those changes.
+    let _ = tcx.sess.time("wf_checking", || {
+        tcx.hir().try_par_for_each_module(|module| tcx.ensure().check_mod_type_wf(module))
+    });
 
-    // NOTE: This is copy/pasted from typeck/lib.rs and should be kept in sync with those changes.
-    tcx.sess.time("item_types_checking", || {
-        tcx.hir().for_each_module(|module| tcx.ensure().check_mod_item_types(module))
-    });
-    tcx.sess.abort_if_errors();
-    tcx.sess.time("missing_docs", || {
-        rustc_lint::check_crate(tcx, rustc_lint::builtin::MissingDoc::new);
-    });
+    tcx.dcx().abort_if_errors();
+
+    tcx.sess.time("missing_docs", || rustc_lint::check_crate(tcx));
     tcx.sess.time("check_mod_attrs", || {
         tcx.hir().for_each_module(|module| tcx.ensure().check_mod_attrs(module))
     });
     rustc_passes::stability::check_unused_or_stable_features(tcx);
 
-    let access_levels = AccessLevels {
-        map: tcx.privacy_access_levels(()).map.iter().map(|(k, v)| (k.to_def_id(), *v)).collect(),
-    };
+    let auto_traits =
+        tcx.all_traits().filter(|&trait_def_id| tcx.trait_is_auto(trait_def_id)).collect();
 
     let mut ctxt = DocContext {
         tcx,
-        resolver,
         param_env: ParamEnv::empty(),
         external_traits: Default::default(),
         active_extern_traits: Default::default(),
-        ty_substs: Default::default(),
-        lt_substs: Default::default(),
-        ct_substs: Default::default(),
+        args: Default::default(),
+        current_type_aliases: Default::default(),
         impl_trait_bounds: Default::default(),
         generated_synthetics: Default::default(),
-        auto_traits: tcx
-            .all_traits(())
-            .iter()
-            .cloned()
-            .filter(|trait_def_id| tcx.trait_is_auto(*trait_def_id))
-            .collect(),
-        module_trait_cache: FxHashMap::default(),
-        cache: Cache::new(access_levels, render_options.document_private),
+        auto_traits,
+        cache: Cache::new(render_options.document_private, render_options.document_hidden),
         inlined: FxHashSet::default(),
         output_format,
         render_options,
+        show_coverage,
     };
+
+    for cnum in tcx.crates(()) {
+        crate::visit_lib::lib_embargo_visit_item(&mut ctxt, cnum.as_def_id());
+    }
 
     // Small hack to force the Sized trait to be present.
     //
     // Note that in case of `#![no_core]`, the trait is not available.
     if let Some(sized_trait_did) = ctxt.tcx.lang_items().sized_trait() {
-        let mut sized_trait = build_external_trait(&mut ctxt, sized_trait_did);
-        sized_trait.is_auto = true;
-        ctxt.external_traits
-            .borrow_mut()
-            .insert(sized_trait_did, TraitWithExtraInfo { trait_: sized_trait, is_notable: false });
+        let sized_trait = build_external_trait(&mut ctxt, sized_trait_did);
+        ctxt.external_traits.insert(sized_trait_did, sized_trait);
     }
 
     debug!("crate: {:?}", tcx.hir().krate());
 
     let mut krate = tcx.sess.time("clean_crate", || clean::krate(&mut ctxt));
 
-    if krate.module.doc_value().map(|d| d.is_empty()).unwrap_or(true) {
+    if krate.module.doc_value().is_empty() {
         let help = format!(
             "The following guide may be of use:\n\
             {}/rustdoc/how-to-write-documentation.html",
             crate::DOC_RUST_LANG_ORG_CHANNEL
         );
-        tcx.struct_lint_node(
+        tcx.node_lint(
             crate::lint::MISSING_CRATE_LEVEL_DOCS,
-            DocContext::as_local_hir_id(tcx, krate.module.def_id).unwrap(),
+            DocContext::as_local_hir_id(tcx, krate.module.item_id).unwrap(),
             |lint| {
-                let mut diag =
-                    lint.build("no documentation found for this crate's top-level module");
-                diag.help(&help);
-                diag.emit();
+                lint.primary_message("no documentation found for this crate's top-level module");
+                lint.help(help);
             },
         );
     }
 
-    fn report_deprecated_attr(name: &str, diag: &rustc_errors::Handler, sp: Span) {
-        let mut msg =
-            diag.struct_span_warn(sp, &format!("the `#![doc({})]` attribute is deprecated", name));
-        msg.note(
-            "see issue #44136 <https://github.com/rust-lang/rust/issues/44136> \
-             for more information",
-        );
-
-        if name == "no_default_passes" {
-            msg.help("you may want to use `#![doc(document_private_items)]`");
-        } else if name.starts_with("plugins") {
-            msg.warn("`#![doc(plugins = \"...\")]` no longer functions; see CVE-2018-1000622 <https://nvd.nist.gov/vuln/detail/CVE-2018-1000622>");
-        }
-
-        msg.emit();
-    }
-
-    let parse_pass = |name: &str, sp: Option<Span>| {
-        if let Some(pass) = passes::find_pass(name) {
-            Some(ConditionalPass::always(pass))
-        } else {
-            let msg = &format!("ignoring unknown pass `{}`", name);
-            let mut warning = if let Some(sp) = sp {
-                tcx.sess.struct_span_warn(sp, msg)
-            } else {
-                tcx.sess.struct_warn(msg)
-            };
-            if name == "collapse-docs" {
-                warning.note("the `collapse-docs` pass was removed in #80261 <https://github.com/rust-lang/rust/pull/80261>");
-            }
-            warning.emit();
-            None
-        }
-    };
-
-    let mut manual_passes: Vec<_> =
-        manual_passes.into_iter().flat_map(|name| parse_pass(&name, None)).collect();
-
     // Process all of the crate attributes, extracting plugin metadata along
     // with the passes which we are supposed to run.
     for attr in krate.module.attrs.lists(sym::doc) {
-        let diag = ctxt.sess().diagnostic();
-
         let name = attr.name_or_empty();
-        if attr.is_word() {
-            if name == sym::no_default_passes {
-                report_deprecated_attr("no_default_passes", diag, attr.span());
-                if default_passes == passes::DefaultPassOption::Default {
-                    default_passes = passes::DefaultPassOption::None;
-                }
-            }
-        } else if let Some(value) = attr.value_str() {
-            match name {
-                sym::passes => {
-                    report_deprecated_attr("passes = \"...\"", diag, attr.span());
-                }
-                sym::plugins => {
-                    report_deprecated_attr("plugins = \"...\"", diag, attr.span());
-                    continue;
-                }
-                _ => continue,
-            };
-            for name in value.as_str().split_whitespace() {
-                let span = attr.name_value_literal_span().unwrap_or(attr.span());
-                manual_passes.extend(parse_pass(name, Some(span)));
-            }
-        }
 
         if attr.is_word() && name == sym::document_private_items {
             ctxt.render_options.document_private = true;
         }
     }
 
-    let passes = passes::defaults(default_passes).iter().copied().chain(manual_passes);
     info!("Executing passes");
 
-    for p in passes {
+    let mut visited = FxHashMap::default();
+    let mut ambiguous = FxIndexMap::default();
+
+    for p in passes::defaults(show_coverage) {
         let run = match p.condition {
             Always => true,
             WhenDocumentPrivate => ctxt.render_options.document_private,
@@ -486,20 +424,29 @@ crate fn run_global_ctxt(
         };
         if run {
             debug!("running pass {}", p.pass.name);
-            krate = ctxt.tcx.sess.time(p.pass.name, || (p.pass.run)(krate, &mut ctxt));
+            if let Some(run_fn) = p.pass.run {
+                krate = tcx.sess.time(p.pass.name, || run_fn(krate, &mut ctxt));
+            } else {
+                let (k, LinkCollector { visited_links, ambiguous_links, .. }) =
+                    passes::collect_intra_doc_links::collect_intra_doc_links(krate, &mut ctxt);
+                krate = k;
+                visited = visited_links;
+                ambiguous = ambiguous_links;
+            }
         }
     }
 
-    ctxt.sess().abort_if_errors();
+    tcx.sess.time("check_lint_expectations", || tcx.check_expectations(Some(sym::rustdoc)));
 
-    let render_options = ctxt.render_options;
-    let mut cache = ctxt.cache;
-    krate = tcx.sess.time("create_format_cache", || cache.populate(krate, tcx, &render_options));
+    krate = tcx.sess.time("create_format_cache", || Cache::populate(&mut ctxt, krate));
 
-    // The main crate doc comments are always collapsed.
-    krate.collapsed = true;
+    let mut collector =
+        LinkCollector { cx: &mut ctxt, visited_links: visited, ambiguous_links: ambiguous };
+    collector.resolve_ambiguities();
 
-    (krate, render_options, cache)
+    tcx.dcx().abort_if_errors();
+
+    (krate, ctxt.render_options, ctxt.cache)
 }
 
 /// Due to <https://github.com/rust-lang/rust/pull/73566>,
@@ -517,16 +464,16 @@ impl<'tcx> EmitIgnoredResolutionErrors<'tcx> {
 }
 
 impl<'tcx> Visitor<'tcx> for EmitIgnoredResolutionErrors<'tcx> {
-    type Map = Map<'tcx>;
+    type NestedFilter = nested_filter::OnlyBodies;
 
-    fn nested_visit_map(&mut self) -> NestedVisitorMap<Self::Map> {
+    fn nested_visit_map(&mut self) -> Self::Map {
         // We need to recurse into nested closures,
         // since those will fallback to the parent for type checking.
-        NestedVisitorMap::OnlyBodies(self.tcx.hir())
+        self.tcx.hir()
     }
 
-    fn visit_path(&mut self, path: &'tcx Path<'_>, _id: HirId) {
-        debug!("visiting path {:?}", path);
+    fn visit_path(&mut self, path: &Path<'tcx>, _id: HirId) {
+        debug!("visiting path {path:?}");
         if path.res == Res::Err {
             // We have less context here than in rustc_resolve,
             // so we can only emit the name and span.
@@ -535,21 +482,20 @@ impl<'tcx> Visitor<'tcx> for EmitIgnoredResolutionErrors<'tcx> {
                 "could not resolve path `{}`",
                 path.segments
                     .iter()
-                    .map(|segment| segment.ident.as_str().to_string())
-                    .collect::<Vec<_>>()
-                    .join("::")
+                    .map(|segment| segment.ident.as_str())
+                    .intersperse("::")
+                    .collect::<String>()
             );
-            let mut err = rustc_errors::struct_span_err!(
-                self.tcx.sess,
+            rustc_errors::struct_span_code_err!(
+                self.tcx.dcx(),
                 path.span,
                 E0433,
-                "failed to resolve: {}",
-                label
-            );
-            err.span_label(path.span, label);
-            err.note("this error was originally ignored because you are running `rustdoc`");
-            err.note("try running again with `rustc` or `cargo check` and you may get a more detailed error");
-            err.emit();
+                "failed to resolve: {label}",
+            )
+            .with_span_label(path.span, label)
+            .with_note("this error was originally ignored because you are running `rustdoc`")
+            .with_note("try running again with `rustc` or `cargo check` and you may get a more detailed error")
+            .emit();
         }
         // We could have an outer resolution that succeeded,
         // but with generic parameters that failed.
@@ -560,8 +506,8 @@ impl<'tcx> Visitor<'tcx> for EmitIgnoredResolutionErrors<'tcx> {
 
 /// `DefId` or parameter index (`ty::ParamTy.index`) of a synthetic type parameter
 /// for `impl Trait` in argument position.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-crate enum ImplTraitParam {
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum ImplTraitParam {
     DefId(DefId),
     ParamIndex(u32),
 }

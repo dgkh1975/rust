@@ -1,24 +1,26 @@
 //! This pass finds basic blocks that are completely equal,
 //! and replaces all uses with just one of them.
 
-use std::{collections::hash_map::Entry, hash::Hash, hash::Hasher, iter};
-
-use crate::MirPass;
+use std::collections::hash_map::Entry;
+use std::hash::{Hash, Hasher};
+use std::iter;
 
 use rustc_data_structures::fx::FxHashMap;
 use rustc_middle::mir::visit::MutVisitor;
 use rustc_middle::mir::*;
 use rustc_middle::ty::TyCtxt;
+use tracing::debug;
 
 use super::simplify::simplify_cfg;
 
-pub struct DeduplicateBlocks;
+pub(super) struct DeduplicateBlocks;
 
-impl<'tcx> MirPass<'tcx> for DeduplicateBlocks {
+impl<'tcx> crate::MirPass<'tcx> for DeduplicateBlocks {
+    fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
+        sess.mir_opt_level() >= 4
+    }
+
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
-        if tcx.sess.mir_opt_level() < 4 {
-            return;
-        }
         debug!("Running DeduplicateBlocks on `{:?}`", body.source);
         let duplicates = find_duplicates(body);
         let has_opts_to_apply = !duplicates.is_empty();
@@ -26,7 +28,7 @@ impl<'tcx> MirPass<'tcx> for DeduplicateBlocks {
         if has_opts_to_apply {
             let mut opt_applier = OptApplier { tcx, duplicates };
             opt_applier.visit_body(body);
-            simplify_cfg(tcx, body);
+            simplify_cfg(body);
         }
     }
 }
@@ -53,11 +55,11 @@ impl<'tcx> MutVisitor<'tcx> for OptApplier<'tcx> {
     }
 }
 
-fn find_duplicates<'a, 'tcx>(body: &'a Body<'tcx>) -> FxHashMap<BasicBlock, BasicBlock> {
+fn find_duplicates(body: &Body<'_>) -> FxHashMap<BasicBlock, BasicBlock> {
     let mut duplicates = FxHashMap::default();
 
     let bbs_to_go_through =
-        body.basic_blocks().iter_enumerated().filter(|(_, bbd)| !bbd.is_cleanup).count();
+        body.basic_blocks.iter_enumerated().filter(|(_, bbd)| !bbd.is_cleanup).count();
 
     let mut same_hashes =
         FxHashMap::with_capacity_and_hasher(bbs_to_go_through, Default::default());
@@ -67,11 +69,10 @@ fn find_duplicates<'a, 'tcx>(body: &'a Body<'tcx>) -> FxHashMap<BasicBlock, Basi
     // For example, if bb1, bb2 and bb3 are duplicates, we will first insert bb3 in same_hashes.
     // Then we will see that bb2 is a duplicate of bb3,
     // and insert bb2 with the replacement bb3 in the duplicates list.
-    // When we see bb1, we see that it is a duplicate of bb3, and therefore insert it in the duplicates list
-    // with replacement bb3.
+    // When we see bb1, we see that it is a duplicate of bb3, and therefore insert it in the
+    // duplicates list with replacement bb3.
     // When the duplicates are removed, we will end up with only bb3.
-    for (bb, bbd) in body.basic_blocks().iter_enumerated().rev().filter(|(_, bbd)| !bbd.is_cleanup)
-    {
+    for (bb, bbd) in body.basic_blocks.iter_enumerated().rev().filter(|(_, bbd)| !bbd.is_cleanup) {
         // Basic blocks can get really big, so to avoid checking for duplicates in basic blocks
         // that are unlikely to have duplicates, we stop early. The early bail number has been
         // found experimentally by eprintln while compiling the crates in the rustc-perf suite.
@@ -97,21 +98,22 @@ fn find_duplicates<'a, 'tcx>(body: &'a Body<'tcx>) -> FxHashMap<BasicBlock, Basi
     duplicates
 }
 
-struct BasicBlockHashable<'tcx, 'a> {
+struct BasicBlockHashable<'a, 'tcx> {
     basic_block_data: &'a BasicBlockData<'tcx>,
 }
 
-impl<'tcx, 'a> Hash for BasicBlockHashable<'tcx, 'a> {
+impl Hash for BasicBlockHashable<'_, '_> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         hash_statements(state, self.basic_block_data.statements.iter());
-        // Note that since we only hash the kind, we lose span information if we deduplicate the blocks
+        // Note that since we only hash the kind, we lose span information if we deduplicate the
+        // blocks.
         self.basic_block_data.terminator().kind.hash(state);
     }
 }
 
-impl<'tcx, 'a> Eq for BasicBlockHashable<'tcx, 'a> {}
+impl Eq for BasicBlockHashable<'_, '_> {}
 
-impl<'tcx, 'a> PartialEq for BasicBlockHashable<'tcx, 'a> {
+impl PartialEq for BasicBlockHashable<'_, '_> {
     fn eq(&self, other: &Self) -> bool {
         self.basic_block_data.statements.len() == other.basic_block_data.statements.len()
             && &self.basic_block_data.terminator().kind == &other.basic_block_data.terminator().kind
@@ -131,7 +133,7 @@ fn hash_statements<'a, 'tcx, H: Hasher>(
     }
 }
 
-fn statement_hash<'tcx, H: Hasher>(hasher: &mut H, stmt: &StatementKind<'tcx>) {
+fn statement_hash<H: Hasher>(hasher: &mut H, stmt: &StatementKind<'_>) {
     match stmt {
         StatementKind::Assign(box (place, rvalue)) => {
             place.hash(hasher);
@@ -141,16 +143,16 @@ fn statement_hash<'tcx, H: Hasher>(hasher: &mut H, stmt: &StatementKind<'tcx>) {
     };
 }
 
-fn rvalue_hash<H: Hasher>(hasher: &mut H, rvalue: &Rvalue<'tcx>) {
+fn rvalue_hash<H: Hasher>(hasher: &mut H, rvalue: &Rvalue<'_>) {
     match rvalue {
         Rvalue::Use(op) => operand_hash(hasher, op),
         x => x.hash(hasher),
     };
 }
 
-fn operand_hash<H: Hasher>(hasher: &mut H, operand: &Operand<'tcx>) {
+fn operand_hash<H: Hasher>(hasher: &mut H, operand: &Operand<'_>) {
     match operand {
-        Operand::Constant(box Constant { user_ty: _, literal, span: _ }) => literal.hash(hasher),
+        Operand::Constant(box ConstOperand { user_ty: _, const_, span: _ }) => const_.hash(hasher),
         x => x.hash(hasher),
     };
 }
@@ -167,7 +169,7 @@ fn statement_eq<'tcx>(lhs: &StatementKind<'tcx>, rhs: &StatementKind<'tcx>) -> b
     res
 }
 
-fn rvalue_eq(lhs: &Rvalue<'tcx>, rhs: &Rvalue<'tcx>) -> bool {
+fn rvalue_eq<'tcx>(lhs: &Rvalue<'tcx>, rhs: &Rvalue<'tcx>) -> bool {
     let res = match (lhs, rhs) {
         (Rvalue::Use(op1), Rvalue::Use(op2)) => operand_eq(op1, op2),
         (x, y) => x == y,
@@ -176,12 +178,12 @@ fn rvalue_eq(lhs: &Rvalue<'tcx>, rhs: &Rvalue<'tcx>) -> bool {
     res
 }
 
-fn operand_eq(lhs: &Operand<'tcx>, rhs: &Operand<'tcx>) -> bool {
+fn operand_eq<'tcx>(lhs: &Operand<'tcx>, rhs: &Operand<'tcx>) -> bool {
     let res = match (lhs, rhs) {
         (
-            Operand::Constant(box Constant { user_ty: _, literal, span: _ }),
-            Operand::Constant(box Constant { user_ty: _, literal: literal2, span: _ }),
-        ) => literal == literal2,
+            Operand::Constant(box ConstOperand { user_ty: _, const_, span: _ }),
+            Operand::Constant(box ConstOperand { user_ty: _, const_: const2, span: _ }),
+        ) => const_ == const2,
         (x, y) => x == y,
     };
     debug!("operand_eq lhs: `{:?}` rhs: `{:?}` result: {:?}", lhs, rhs, res);

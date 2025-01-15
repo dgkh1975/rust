@@ -1,6 +1,4 @@
 use core::cell::*;
-use core::default::Default;
-use std::mem::drop;
 
 #[test]
 fn smoketest_unsafe_cell() {
@@ -62,10 +60,10 @@ fn cell_update() {
 #[test]
 fn cell_has_sensible_show() {
     let x = Cell::new("foo bar");
-    assert!(format!("{:?}", x).contains(x.get()));
+    assert!(format!("{x:?}").contains(x.get()));
 
     x.set("baz qux");
-    assert!(format!("{:?}", x).contains(x.get()));
+    assert!(format!("{x:?}").contains(x.get()));
 }
 
 #[test]
@@ -73,11 +71,13 @@ fn ref_and_refmut_have_sensible_show() {
     let refcell = RefCell::new("foo");
 
     let refcell_refmut = refcell.borrow_mut();
-    assert!(format!("{:?}", refcell_refmut).contains("foo"));
+    assert_eq!(format!("{refcell_refmut}"), "foo"); // Display
+    assert!(format!("{refcell_refmut:?}").contains("foo")); // Debug
     drop(refcell_refmut);
 
     let refcell_ref = refcell.borrow();
-    assert!(format!("{:?}", refcell_ref).contains("foo"));
+    assert_eq!(format!("{refcell_ref}"), "foo"); // Display
+    assert!(format!("{refcell_ref:?}").contains("foo")); // Debug
     drop(refcell_ref);
 }
 
@@ -465,4 +465,15 @@ fn const_cells() {
 
     const CELL: Cell<i32> = Cell::new(3);
     const _: i32 = CELL.into_inner();
+
+    /* FIXME(#110395)
+        const UNSAFE_CELL_FROM: UnsafeCell<i32> = UnsafeCell::from(3);
+        const _: i32 = UNSAFE_CELL.into_inner();
+
+        const REF_CELL_FROM: RefCell<i32> = RefCell::from(3);
+        const _: i32 = REF_CELL.into_inner();
+
+        const CELL_FROM: Cell<i32> = Cell::from(3);
+        const _: i32 = CELL.into_inner();
+    */
 }
